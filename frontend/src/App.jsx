@@ -25,7 +25,12 @@ import SearchArea from './components/SearchArea';
 import IdentityPanel from './components/IdentityPanel';
 import ProcessLog from './components/ProcessLog';
 import DocumentChecker from './components/DocumentChecker';
-import { WatchlistScreeningPanel, MakerCheckerGovernancePanel } from './components/GovernanceAndWatchlist';
+import {
+    WatchlistScreeningPanel,
+    MakerCheckerGovernancePanel,
+    LiveSystemStatusBar,
+    CaseWorkspaceTabs,
+} from './components/GovernanceAndWatchlist';
 
 // --- Reusable Components (Keep mainly existing ones for consistency if needed by children) ---
 const Spinner = ({ size = 'md' }) => {
@@ -407,7 +412,9 @@ const RecommendationIcon = ({ recommendation }) => {
     }
 };
 
-const SummaryReport = ({ summary }) => {
+const SummaryReport = ({ summary, onOpenGovernance }) => {
+    const [expandReviewQueue, setExpandReviewQueue] = useState(false);
+
     if (!summary) return null;
 
     if (typeof summary === 'string' || (summary.summary_text && !summary.risk_score)) {
@@ -424,10 +431,15 @@ const SummaryReport = ({ summary }) => {
         );
     }
 
+    const reviewItems = summary.requires_human_review || [];
+    const visibleReviewItems = expandReviewQueue ? reviewItems : reviewItems.slice(0, 4);
+
     return (
         <Card className="space-y-6 !bg-slate-900 border border-slate-800 shadow-sm relative overflow-hidden">
             {/* Decorative Background for High Risk */}
-            {summary.risk_score === 'High' && <div className="absolute top-0 right-0 w-32 h-32 bg-red-500/10 rounded-bl-full pointer-events-none"></div>}
+            {(summary.risk_score === 'High' || summary.risk_score === 'Critical') && (
+                <div className="absolute top-0 right-0 w-32 h-32 bg-red-500/10 rounded-bl-full pointer-events-none"></div>
+            )}
 
             <div className="flex flex-col md:flex-row md:justify-between md:items-start gap-4 border-b border-slate-800 pb-4 relative z-10">
                 <div className="space-y-1 flex-1">
@@ -440,9 +452,6 @@ const SummaryReport = ({ summary }) => {
                         <RiskIndicator level={summary.risk_score} />
                     </div>
                     <div className="flex flex-col items-end">
-                        {/* "Screening Outcome", not "Action". This tool reports what the
-                            adverse-media search found; the accept/reject decision belongs
-                            to a human in the bank's own workflow. */}
                         <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Screening Outcome</span>
                         <span className={`px-3 py-1 rounded-full text-xs font-bold border flex items-center gap-1 ${recommendationStyle(summary.recommendation)}`}>
                             <RecommendationIcon recommendation={summary.recommendation} />
@@ -452,7 +461,6 @@ const SummaryReport = ({ summary }) => {
                 </div>
             </div>
 
-            {/* Screening coverage: a verdict is only as good as the search behind it. */}
             {summary.screening_coverage && summary.screening_coverage.is_complete === false && (
                 <div className="bg-amber-950/40 border border-amber-800 rounded-xl p-4 flex gap-3 items-start">
                     <AlertTriangle size={18} className="text-amber-400 shrink-0 mt-0.5" />
@@ -467,22 +475,44 @@ const SummaryReport = ({ summary }) => {
                 </div>
             )}
 
-            {/* Items a machine must not dispose of on its own. */}
-            {summary.requires_human_review && summary.requires_human_review.length > 0 && (
+            {/* Compact / Paginated Human Review Queue */}
+            {reviewItems.length > 0 && (
                 <div className="overflow-hidden bg-slate-900 rounded-lg border border-amber-900/60 shadow-sm">
-                    <div className="bg-amber-950/40 px-4 py-2 border-b border-amber-900/60 flex items-center gap-2">
-                        <UserCheck size={13} className="text-amber-400" />
-                        <h3 className="font-bold text-xs text-amber-300 uppercase tracking-wide">
-                            Requires Human Review ({summary.requires_human_review.length})
-                        </h3>
+                    <div className="bg-amber-950/40 px-4 py-2.5 border-b border-amber-900/60 flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                            <UserCheck size={14} className="text-amber-400" />
+                            <h3 className="font-bold text-xs text-amber-300 uppercase tracking-wide">
+                                Requires Human Review ({reviewItems.length} Items)
+                            </h3>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            {reviewItems.length > 4 && (
+                                <button
+                                    type="button"
+                                    onClick={() => setExpandReviewQueue(prev => !prev)}
+                                    className="text-[11px] font-semibold text-slate-300 hover:text-white px-2 py-0.5 rounded bg-slate-900/70 border border-slate-700"
+                                >
+                                    {expandReviewQueue ? 'Show Top 4' : `Show All ${reviewItems.length}`}
+                                </button>
+                            )}
+                            {onOpenGovernance && (
+                                <button
+                                    type="button"
+                                    onClick={onOpenGovernance}
+                                    className="text-[11px] font-bold text-amber-200 hover:text-white px-2.5 py-0.5 rounded bg-amber-900/60 border border-amber-700"
+                                >
+                                    Disposition in Maker-Checker →
+                                </button>
+                            )}
+                        </div>
                     </div>
                     <ul className="divide-y divide-slate-800">
-                        {summary.requires_human_review.map((item, i) => (
-                            <li key={i} className="px-4 py-3">
-                                <p className="text-sm font-semibold text-slate-200">{item.reason}</p>
+                        {visibleReviewItems.map((item, i) => (
+                            <li key={i} className="px-4 py-2.5">
+                                <p className="text-xs font-semibold text-slate-200">{item.title ? `${item.title} — ${item.reason}` : item.reason}</p>
                                 <p className="text-xs text-slate-400 mt-0.5">{item.detail}</p>
                                 {item.citations && item.citations.length > 0 && (
-                                    <div className="mt-1.5 flex gap-1 flex-wrap">
+                                    <div className="mt-1 flex gap-1 flex-wrap">
                                         {item.citations.slice(0, 3).map((url, ci) => (
                                             <a key={ci} href={url} target="_blank" rel="noopener noreferrer"
                                                 className="inline-flex items-center text-[10px] text-blue-400 hover:text-blue-300 bg-blue-900/20 px-1.5 py-0.5 rounded border border-blue-800">
@@ -596,6 +626,8 @@ function App() {
     const [governanceState, setGovernanceState] = useState(null);
     const [personaKey, setPersonaKey] = useState('maker');
     const [savingWatchlistHitId, setSavingWatchlistHitId] = useState(null);
+    const [activeTab, setActiveTab] = useState('overview');
+    const [lastHeartbeatAt, setLastHeartbeatAt] = useState(null);
 
     const eventSourceRef = useRef(null);
 
@@ -827,12 +859,14 @@ function App() {
 
                 switch (data.status) {
                     case 'heartbeat':
+                        setLastHeartbeatAt(new Date().toLocaleTimeString());
                         if (data.subject_id && !streamedSubjectId) {
                             streamedSubjectId = data.subject_id;
                             setCurrentSubjectId(data.subject_id);
                         }
                         break;
                     case 'subject_initialized':
+                        setLastHeartbeatAt(new Date().toLocaleTimeString());
                         if (data.subject_id) {
                             streamedSubjectId = data.subject_id;
                             setCurrentSubjectId(data.subject_id);
@@ -1201,80 +1235,170 @@ function App() {
         extractProfileFromGraph(loadedGraphData, searchSubject),
         [loadedGraphData, searchSubject]);
 
+    const hasActiveCase = Boolean(
+        isSearching || summary || results.length > 0 || watchlistData || currentSubjectId || searchSubject
+    );
+    const reviewQueueItems = summary?.requires_human_review || [];
+    const dispMap = governanceState?.dispositions || {};
+    const undispositionedCount = reviewQueueItems.filter(
+        (it, idx) => !dispMap[it.finding_id || `review-item-${idx}`]
+    ).length;
+
     return (
         <div className="bg-slate-950 font-sans text-slate-50 min-h-screen flex flex-col">
             <Header settings={settings} onOpenSettings={() => setIsSettingsModalOpen(true)} costStats={costStats} />
 
-            <main className="flex-grow p-6 flex flex-col gap-6 pb-24">
-                {/* Top Section: Split between Search and Identity */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-                    {/* Left: Search Area */}
-                    <div className="lg:col-span-7 xl:col-span-8">
-                        <SearchArea
-                            onSearch={performSearch}
-                            isSearching={isSearching}
-                            searchMode={searchMode}
-                            setSearchMode={setSearchMode}
-                            savedSubjects={savedSubjects}
-                            onLoadSubject={handleLoadSubject}
-                            loadingSubjects={loadingSubjects}
-                            initialFormData={pendingSearch?.formData}
-                        />
-                        {/* Results Section directly below search */}
-                        <div className="mt-8">
-                            {/* Coverage banner sits ABOVE the summary: a reviewer must
-                                see that the search was degraded before they read any
-                                conclusion drawn from it. */}
-                            {coverageAlert && (
-                                <div className={`mb-6 rounded-xl p-4 flex gap-3 items-start border ${coverageAlert.severity === 'critical'
-                                    ? 'bg-red-950/40 border-red-800'
-                                    : 'bg-amber-950/40 border-amber-800'}`}>
-                                    <AlertTriangle
-                                        size={18}
-                                        className={`shrink-0 mt-0.5 ${coverageAlert.severity === 'critical' ? 'text-red-400' : 'text-amber-400'}`}
-                                    />
-                                    <div>
-                                        <h3 className={`text-xs font-bold uppercase tracking-wide mb-1 ${coverageAlert.severity === 'critical' ? 'text-red-300' : 'text-amber-300'}`}>
-                                            {coverageAlert.severity === 'critical'
-                                                ? 'Screening Incomplete'
-                                                : 'Degraded Search Coverage'}
-                                        </h3>
-                                        <p className={`text-sm ${coverageAlert.severity === 'critical' ? 'text-red-100/80' : 'text-amber-100/80'}`}>
-                                            {coverageAlert.message}
-                                            {coverageAlert.severity === 'critical' &&
-                                                ' No conclusion about this subject can be drawn from this run.'}
-                                        </p>
-                                    </div>
-                                </div>
-                            )}
+            {/* Sticky Production Telemetry & Pipeline Status Bar */}
+            <LiveSystemStatusBar
+                isSearching={isSearching}
+                status={status}
+                progress={progress}
+                resultsCount={results.length}
+                summary={summary}
+                watchlistData={watchlistData}
+                watchlistStatus={watchlistStatus}
+                governanceState={governanceState}
+                lastHeartbeatAt={lastHeartbeatAt}
+                searchSubject={searchSubject}
+            />
 
-                            {(watchlistData || watchlistStatus) && (
-                                <div className="mb-6">
+            <main className="flex-grow px-6 py-5 max-w-[1600px] w-full mx-auto flex flex-col gap-5 pb-24">
+                <SearchArea
+                    onSearch={(fd, kw) => {
+                        setActiveTab('overview');
+                        performSearch(fd, kw);
+                    }}
+                    isSearching={isSearching}
+                    searchMode={searchMode}
+                    setSearchMode={setSearchMode}
+                    savedSubjects={savedSubjects}
+                    onLoadSubject={(sid) => {
+                        setActiveTab('overview');
+                        handleLoadSubject(sid);
+                    }}
+                    loadingSubjects={loadingSubjects}
+                    initialFormData={pendingSearch?.formData}
+                />
+
+                {coverageAlert && (
+                    <div className={`rounded-xl p-4 flex gap-3 items-start border ${coverageAlert.severity === 'critical'
+                        ? 'bg-red-950/40 border-red-800'
+                        : 'bg-amber-950/40 border-amber-800'}`}>
+                        <AlertTriangle
+                            size={18}
+                            className={`shrink-0 mt-0.5 ${coverageAlert.severity === 'critical' ? 'text-red-400' : 'text-amber-400'}`}
+                        />
+                        <div>
+                            <h3 className={`text-xs font-bold uppercase tracking-wide mb-1 ${coverageAlert.severity === 'critical' ? 'text-red-300' : 'text-amber-300'}`}>
+                                {coverageAlert.severity === 'critical'
+                                    ? 'Screening Incomplete'
+                                    : 'Degraded Search Coverage'}
+                            </h3>
+                            <p className={`text-sm ${coverageAlert.severity === 'critical' ? 'text-red-100/80' : 'text-amber-100/80'}`}>
+                                {coverageAlert.message}
+                                {coverageAlert.severity === 'critical' &&
+                                    ' No conclusion about this subject can be drawn from this run.'}
+                            </p>
+                        </div>
+                    </div>
+                )}
+
+                {hasActiveCase ? (
+                    <div>
+                        <CaseWorkspaceTabs
+                            activeTab={activeTab}
+                            onChangeTab={setActiveTab}
+                            watchlistHitsCount={watchlistData?.total_hits || 0}
+                            watchlistStatusLabel={watchlistData?.status || 'CLEAR'}
+                            reviewQueueCount={reviewQueueItems.length}
+                            undispositionedCount={undispositionedCount}
+                            reviewState={governanceState?.case_review?.review_state || 'UNREVIEWED'}
+                            resultsCount={results.length}
+                        />
+
+                        {/* TAB 1: EXECUTIVE OVERVIEW */}
+                        {activeTab === 'overview' && (
+                            <div className="space-y-5 animate-fade-in">
+                                {(watchlistData || watchlistStatus) && (
                                     <ErrorBoundary>
                                         <WatchlistScreeningPanel
+                                            compact={true}
                                             watchlistData={watchlistData}
                                             watchlistStatus={watchlistStatus}
-                                            onRefreshLists={handleRefreshWatchlists}
-                                            refreshingLists={refreshingLists}
-                                            dispositions={governanceState?.dispositions || {}}
-                                            onSaveDisposition={currentSubjectId ? handleSaveWatchlistHitDisposition : null}
-                                            savingItemId={savingWatchlistHitId}
-                                            isCaseLocked={governanceState?.case_review?.review_state === 'APPROVED'}
+                                            onOpenFullWatchlist={() => setActiveTab('watchlist')}
                                         />
                                     </ErrorBoundary>
-                                </div>
-                            )}
+                                )}
 
-                            {summary && (
-                                <div className="mb-6">
+                                {summary ? (
                                     <ErrorBoundary>
-                                        <SummaryReport summary={summary} />
+                                        <SummaryReport
+                                            summary={summary}
+                                            onOpenGovernance={() => setActiveTab('governance')}
+                                        />
                                     </ErrorBoundary>
-                                </div>
-                            )}
+                                ) : isSearching ? (
+                                    <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 flex items-center justify-between gap-4">
+                                        <div className="flex items-center gap-4">
+                                            <Spinner size="sm" />
+                                            <div>
+                                                <h3 className="text-sm font-bold text-slate-100">
+                                                    Synthesizing Screening Evidence for {searchSubject}...
+                                                </h3>
+                                                <p className="text-xs text-slate-400 mt-0.5">
+                                                    {progress[progress.length - 1]?.message || 'Running multi-angle adverse media discovery & full-text risk scoring...'}
+                                                    {' '}({results.length} sources analyzed so far)
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => setActiveTab('sources')}
+                                            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-blue-300 border border-slate-700 shrink-0"
+                                        >
+                                            View Live Feed ({results.length}) →
+                                        </button>
+                                    </div>
+                                ) : null}
 
-                            {currentSubjectId && (summary || watchlistData || governanceState) && (
-                                <div className="mb-8">
+                                {/* Show live incoming sources table while searching or if summary not yet generated */}
+                                {(isSearching || !summary) && results.length > 0 && (
+                                    <ResultsTable
+                                        results={results}
+                                        riskCategoryFilter={riskCategoryFilter}
+                                        onFilterChange={setRiskCategoryFilter}
+                                        appConfig={appConfig}
+                                        searchId={searchId}
+                                        subjectName={searchSubject || 'Subject'}
+                                        setCostStats={setCostStats}
+                                        loadedGraphData={loadedGraphData}
+                                    />
+                                )}
+                            </div>
+                        )}
+
+                        {/* TAB 2: SANCTIONS & WATCHLISTS */}
+                        {activeTab === 'watchlist' && (
+                            <div className="animate-fade-in">
+                                <ErrorBoundary>
+                                    <WatchlistScreeningPanel
+                                        watchlistData={watchlistData}
+                                        watchlistStatus={watchlistStatus}
+                                        onRefreshLists={handleRefreshWatchlists}
+                                        refreshingLists={refreshingLists}
+                                        dispositions={governanceState?.dispositions || {}}
+                                        onSaveDisposition={currentSubjectId ? handleSaveWatchlistHitDisposition : null}
+                                        savingItemId={savingWatchlistHitId}
+                                        isCaseLocked={governanceState?.case_review?.review_state === 'APPROVED'}
+                                    />
+                                </ErrorBoundary>
+                            </div>
+                        )}
+
+                        {/* TAB 3: FOUR-EYES MAKER-CHECKER GOVERNANCE & AUDIT TRAIL */}
+                        {activeTab === 'governance' && (
+                            <div className="animate-fade-in">
+                                {currentSubjectId ? (
                                     <ErrorBoundary>
                                         <MakerCheckerGovernancePanel
                                             subjectId={currentSubjectId}
@@ -1287,44 +1411,46 @@ function App() {
                                             onRefreshGovernance={() => fetchSubjectGovernance(currentSubjectId)}
                                         />
                                     </ErrorBoundary>
+                                ) : (
+                                    <div className="p-8 text-center text-sm text-slate-400 bg-slate-900 rounded-xl border border-slate-800">
+                                        Run a search or load a subject record to access Four-Eyes Maker-Checker Governance.
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {/* TAB 4: ADVERSE MEDIA SOURCES & ENTITY GRAPH */}
+                        {activeTab === 'sources' && (
+                            <div className="animate-fade-in">
+                                <ResultsTable
+                                    results={results}
+                                    riskCategoryFilter={riskCategoryFilter}
+                                    onFilterChange={setRiskCategoryFilter}
+                                    appConfig={appConfig}
+                                    searchId={searchId}
+                                    subjectName={searchSubject || 'Subject'}
+                                    setCostStats={setCostStats}
+                                    loadedGraphData={loadedGraphData}
+                                />
+                            </div>
+                        )}
+
+                        {/* TAB 5: IDENTITY PROFILE & DOCUMENTS */}
+                        {activeTab === 'profile' && (
+                            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 animate-fade-in">
+                                <div className="lg:col-span-6">
+                                    <IdentityPanel
+                                        selectedCandidate={selectedCandidate}
+                                        candidates={candidates}
+                                        onSelectCandidate={handleCandidateSelect}
+                                        subjectProfile={{
+                                            ...(pendingSearch?.formData || {}),
+                                            ...(existingSubject?.profile_data || {}),
+                                            ...graphDerivedProfile
+                                        }}
+                                    />
                                 </div>
-                            )}
-
-                            <ResultsTable
-                                results={results}
-                                riskCategoryFilter={riskCategoryFilter}
-                                onFilterChange={setRiskCategoryFilter}
-                                appConfig={appConfig}
-                                searchId={searchId}
-                                subjectName={searchSubject || 'Subject'}
-                                setCostStats={setCostStats}
-                                loadedGraphData={loadedGraphData}
-                            />
-
-                            {!isSearching && progress.length > 0 && results.length === 0 && (
-                                <div className="text-center py-10 text-slate-500 bg-slate-900/50 rounded-xl border border-slate-800">
-                                    No adverse media found for this subject.
-                                </div>
-                            )}
-                        </div>
-                    </div>
-
-                    {/* Right: Identity Panel (Sticky) */}
-                    <div className="lg:col-span-5 xl:col-span-4">
-                        <div className="sticky top-24 space-y-6">
-                            <IdentityPanel
-                                selectedCandidate={selectedCandidate}
-                                candidates={candidates}
-                                onSelectCandidate={handleCandidateSelect}
-                                subjectProfile={{
-                                    ...(pendingSearch?.formData || {}),
-                                    ...(existingSubject?.profile_data || {}),
-                                    ...graphDerivedProfile
-                                }}
-                            />
-
-                            {(existingSubject || searchSubject) && (
-                                <div className="h-[400px]">
+                                <div className="lg:col-span-6 h-[420px]">
                                     <DocumentChecker
                                         subjectId={existingSubject?.subject_id || searchId}
                                         subjectName={existingSubject?.name || searchSubject}
@@ -1333,10 +1459,20 @@ function App() {
                                         }}
                                     />
                                 </div>
-                            )}
-                        </div>
+                            </div>
+                        )}
                     </div>
-                </div>
+                ) : (
+                    /* Clean Idle Landing State: Watchlist Readiness Strip */
+                    <ErrorBoundary>
+                        <WatchlistScreeningPanel
+                            watchlistData={null}
+                            watchlistStatus={watchlistStatus}
+                            onRefreshLists={handleRefreshWatchlists}
+                            refreshingLists={refreshingLists}
+                        />
+                    </ErrorBoundary>
+                )}
             </main>
 
             {/* Collapsible Process Log (Fixed Bottom) */}

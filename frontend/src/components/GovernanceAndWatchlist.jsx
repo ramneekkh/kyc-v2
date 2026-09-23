@@ -5,15 +5,20 @@ import {
     AlertTriangle,
     UserCheck,
     Lock,
-    Unlock,
     RefreshCw,
     FileCheck,
     History,
-    User,
     Users,
     AlertOctagon,
     ChevronDown,
     ChevronUp,
+    Activity,
+    Radio,
+    Layers,
+    Database,
+    FileText,
+    Network,
+    User,
 } from 'lucide-react';
 
 const DISPOSITION_OPTIONS = [
@@ -75,6 +80,239 @@ const stateBadge = (state) => {
     }
 };
 
+// ---------------------------------------------------------------------------
+// 1. Compact Production Status Bar (Sticky under Header)
+// ---------------------------------------------------------------------------
+
+export const LiveSystemStatusBar = ({
+    isSearching,
+    status,
+    progress = [],
+    resultsCount = 0,
+    summary,
+    watchlistData,
+    watchlistStatus,
+    governanceState,
+    lastHeartbeatAt,
+    searchSubject,
+}) => {
+    const [elapsedSec, setElapsedSec] = useState(0);
+
+    useEffect(() => {
+        if (!isSearching) {
+            setElapsedSec(0);
+            return;
+        }
+        const t0 = Date.now();
+        const timer = setInterval(() => {
+            setElapsedSec(Math.floor((Date.now() - t0) / 1000));
+        }, 1000);
+        return () => clearInterval(timer);
+    }, [isSearching]);
+
+    const latestEvent = progress.length > 0 ? progress[progress.length - 1] : null;
+    const latestStatus = latestEvent?.status || status;
+
+    // Determine active pipeline step (1..5)
+    let activeStep = 0;
+    if (isSearching || summary || resultsCount > 0 || watchlistData) {
+        if (summary) {
+            activeStep = 5;
+        } else if (resultsCount > 0 || latestStatus === 'analyzing_results' || latestStatus === 'kyc_result_generated') {
+            activeStep = 4;
+        } else if (latestStatus === 'brainstorming' || latestStatus === 'queries_generated' || latestStatus === 'performing_distributed_searches') {
+            activeStep = 3;
+        } else if (latestStatus === 'performing_priority_searches' || latestStatus === 'analyzing_priority_results') {
+            activeStep = 2;
+        } else {
+            activeStep = 1;
+        }
+    }
+
+    const steps = [
+        { id: 1, label: '1. Watchlists (4/4)' },
+        { id: 2, label: '2. Priority Scan' },
+        { id: 3, label: '3. AI Query Discovery' },
+        { id: 4, label: `4. Source Analysis (${resultsCount})` },
+        { id: 5, label: '5. Summary & Graph' },
+    ];
+
+    const totalEntities =
+        watchlistData?.coverage?.total_entities_indexed ||
+        watchlistStatus?.total_entities_indexed ||
+        27529;
+    const reviewState = governanceState?.case_review?.review_state || 'UNREVIEWED';
+    const formatTime = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+
+    return (
+        <div className="bg-slate-900/95 backdrop-blur border-b border-slate-800 px-6 py-2 sticky top-[65px] z-30 shadow-sm">
+            <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3 text-xs">
+                {/* Left: Live Engine Status Pill + Current Action */}
+                <div className="flex items-center gap-3 min-w-0">
+                    {isSearching ? (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-950/80 text-blue-300 border border-blue-700 font-semibold shrink-0">
+                            <span className="h-2 w-2 rounded-full bg-blue-400 animate-ping" />
+                            LIVE STREAM · {formatTime(elapsedSec)}
+                        </span>
+                    ) : summary ? (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-950/70 text-emerald-300 border border-emerald-800 font-semibold shrink-0">
+                            <CheckCircle size={12} />
+                            ASSESSMENT READY
+                        </span>
+                    ) : (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-semibold shrink-0">
+                            <Activity size={12} className="text-emerald-400" />
+                            SYSTEM READY
+                        </span>
+                    )}
+
+                    <span className="text-slate-300 truncate max-w-md font-medium">
+                        {isSearching
+                            ? latestEvent?.message || `Screening ${searchSubject || 'subject'}...`
+                            : searchSubject
+                                ? `Active Case: ${searchSubject}`
+                                : 'Select a saved record or enter a subject name to start screening'}
+                    </span>
+
+                    {isSearching && lastHeartbeatAt && (
+                        <span
+                            className="hidden md:inline-flex items-center gap-1 text-[10px] font-mono text-emerald-400 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/60"
+                            title={`Last SSE keepalive frame received at ${lastHeartbeatAt}`}
+                        >
+                            <Radio size={10} /> SSE Keepalive OK
+                        </span>
+                    )}
+                </div>
+
+                {/* Center: Compact 5-Stage Pipeline Stepper */}
+                <div className="hidden xl:flex items-center gap-1.5">
+                    {steps.map((st) => {
+                        const isDone = (!isSearching && summary && st.id <= 5) || activeStep > st.id;
+                        const isCurrent = isSearching && activeStep === st.id;
+                        return (
+                            <span
+                                key={st.id}
+                                className={`px-2 py-0.5 rounded text-[11px] font-medium border transition-colors ${
+                                    isCurrent
+                                        ? 'bg-blue-600/30 text-blue-200 border-blue-500 font-semibold'
+                                        : isDone
+                                            ? 'bg-emerald-950/50 text-emerald-300 border-emerald-800/70'
+                                            : 'bg-slate-950/60 text-slate-500 border-slate-800'
+                                }`}
+                            >
+                                {st.label}
+                            </span>
+                        );
+                    })}
+                </div>
+
+                {/* Right: Institutional Telemetry Counters */}
+                <div className="flex items-center gap-3 text-[11px] text-slate-400 shrink-0">
+                    <span className="hidden sm:inline-flex items-center gap-1 font-mono bg-slate-950 px-2.5 py-1 rounded border border-slate-800">
+                        <ShieldAlert size={11} className="text-emerald-400" />
+                        Lists: <strong className="text-slate-200">4/4</strong> ({totalEntities.toLocaleString()})
+                    </span>
+                    {searchSubject && (
+                        <span className={`inline-flex items-center gap-1 font-mono px-2.5 py-1 rounded border ${stateBadge(reviewState)}`}>
+                            <UserCheck size={11} />
+                            {reviewState}
+                        </span>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// ---------------------------------------------------------------------------
+// 2. Institutional Workspace Tab Bar (Declutters the Page into Clean Views)
+// ---------------------------------------------------------------------------
+
+export const CaseWorkspaceTabs = ({
+    activeTab,
+    onChangeTab,
+    watchlistHitsCount = 0,
+    watchlistStatusLabel = 'CLEAR',
+    reviewQueueCount = 0,
+    undispositionedCount = 0,
+    reviewState = 'UNREVIEWED',
+    resultsCount = 0,
+}) => {
+    const tabs = [
+        {
+            id: 'overview',
+            label: 'Executive Summary',
+            icon: <FileText size={14} />,
+            badge: reviewQueueCount > 0 ? `${reviewQueueCount} Review` : 'Clean',
+            badgeColor: reviewQueueCount > 0 ? 'bg-amber-900/50 text-amber-300 border-amber-700' : 'bg-emerald-900/40 text-emerald-300 border-emerald-800',
+        },
+        {
+            id: 'watchlist',
+            label: 'Sanctions & Watchlists',
+            icon: <ShieldAlert size={14} />,
+            badge: watchlistHitsCount > 0 ? `${watchlistHitsCount} Hit(s)` : '4/4 Clear',
+            badgeColor: watchlistHitsCount > 0 ? 'bg-red-900/60 text-red-200 border-red-600' : 'bg-emerald-900/40 text-emerald-300 border-emerald-800',
+        },
+        {
+            id: 'governance',
+            label: 'Maker-Checker & Audit',
+            icon: <UserCheck size={14} />,
+            badge: undispositionedCount > 0 ? `${undispositionedCount} Pending` : reviewState,
+            badgeColor: stateBadge(reviewState),
+        },
+        {
+            id: 'sources',
+            label: 'Media Sources & Graph',
+            icon: <Network size={14} />,
+            badge: `${resultsCount} Sources`,
+            badgeColor: 'bg-slate-800 text-slate-300 border-slate-700',
+        },
+        {
+            id: 'profile',
+            label: 'Identity & Documents',
+            icon: <User size={14} />,
+            badge: 'CDD / ID',
+            badgeColor: 'bg-slate-800 text-slate-400 border-slate-700',
+        },
+    ];
+
+    return (
+        <div className="flex items-center gap-1.5 overflow-x-auto bg-slate-900/90 p-1.5 rounded-xl border border-slate-800 mb-5">
+            {tabs.map((tab) => {
+                const isActive = activeTab === tab.id;
+                return (
+                    <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => onChangeTab(tab.id)}
+                        className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all whitespace-nowrap ${
+                            isActive
+                                ? 'bg-blue-600 text-white shadow-sm'
+                                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                        }`}
+                    >
+                        {tab.icon}
+                        <span>{tab.label}</span>
+                        <span
+                            className={`px-2 py-0.5 text-[10px] font-bold rounded-full border ${
+                                isActive
+                                    ? 'bg-blue-900/70 text-blue-100 border-blue-400/50'
+                                    : tab.badgeColor
+                            }`}
+                        >
+                            {tab.badge}
+                        </span>
+                    </button>
+                );
+            })}
+        </div>
+    );
+};
+
+// ---------------------------------------------------------------------------
+// 3. Watchlist Screening Panel (Full + Compact Strip Mode)
+// ---------------------------------------------------------------------------
+
 export const WatchlistScreeningPanel = ({
     watchlistData,
     watchlistStatus,
@@ -84,6 +322,8 @@ export const WatchlistScreeningPanel = ({
     onSaveDisposition,
     savingItemId,
     isCaseLocked,
+    compact = false,
+    onOpenFullWatchlist,
 }) => {
     const [draftVerdicts, setDraftVerdicts] = useState({});
     const [draftRationales, setDraftRationales] = useState({});
@@ -92,6 +332,53 @@ export const WatchlistScreeningPanel = ({
     const hits = watchlistData?.hits || [];
     const lists = coverage?.lists || [];
     const status = watchlistData?.status || (coverage?.is_complete ? 'READY' : 'LOADING');
+
+    if (compact) {
+        return (
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <div className="flex items-center gap-3">
+                    <div className={`p-2 rounded-lg border ${
+                        hits.length > 0
+                            ? 'bg-red-950/60 border-red-700 text-red-400'
+                            : 'bg-emerald-950/50 border-emerald-800 text-emerald-400'
+                    }`}>
+                        <ShieldAlert size={18} />
+                    </div>
+                    <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-bold text-slate-100">
+                                Sanctions & Watchlist Screening:
+                            </span>
+                            <span className={`px-2 py-0.5 text-[10px] font-bold rounded-full border ${
+                                hits.length > 0
+                                    ? 'bg-red-900/50 text-red-200 border-red-600'
+                                    : 'bg-emerald-900/40 text-emerald-300 border-emerald-700'
+                            }`}>
+                                {hits.length > 0 ? `${hits.length} Designation Match(es)` : '0 Hits across 4 Official Lists (CLEAR)'}
+                            </span>
+                            {lists.map(l => (
+                                <span key={l.list_id} className="hidden md:inline-block text-[10px] font-mono px-2 py-0.5 rounded bg-slate-950 text-slate-400 border border-slate-800">
+                                    {l.list_id}: {(l.entity_count || 0).toLocaleString()}
+                                </span>
+                            ))}
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                            Screened against MAS Singapore (`SG_MAS`), US Treasury OFAC (`US_OFAC_SDN`), UN Security Council (`UN_SC`), and EU Consolidated (`EU_FSF`).
+                        </p>
+                    </div>
+                </div>
+                {onOpenFullWatchlist && (
+                    <button
+                        type="button"
+                        onClick={onOpenFullWatchlist}
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-blue-300 border border-slate-700 shrink-0"
+                    >
+                        {hits.length > 0 ? `Review ${hits.length} Hit(s) →` : 'Inspect Watchlists →'}
+                    </button>
+                )}
+            </div>
+        );
+    }
 
     const handleSave = (hit) => {
         const itemId = hit.hit_id;
@@ -160,7 +447,6 @@ export const WatchlistScreeningPanel = ({
                 )}
             </div>
 
-            {/* 4 Authority List Cards */}
             {lists.length > 0 && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                     {lists.map((lst) => {
@@ -201,8 +487,11 @@ export const WatchlistScreeningPanel = ({
                 </div>
             )}
 
-            {/* Watchlist Hits List */}
-            {hits.length > 0 && (
+            {hits.length === 0 ? (
+                <div className="p-6 rounded-xl bg-slate-950/50 border border-slate-800 text-center text-xs text-slate-400">
+                    No designation matches found across MAS (`SG_MAS`), OFAC SDN (`US_OFAC_SDN`), UN Security Council (`UN_SC`), or EU Consolidated (`EU_FSF`).
+                </div>
+            ) : (
                 <div className="space-y-3">
                     <h3 className="text-xs font-bold uppercase tracking-wider text-red-300 flex items-center gap-1.5">
                         <AlertOctagon size={14} className="text-red-400" />
@@ -259,7 +548,6 @@ export const WatchlistScreeningPanel = ({
                                     </div>
                                 </div>
 
-                                {/* Inline Maker Disposition Control */}
                                 {onSaveDisposition && (
                                     <div className="pt-3 border-t border-slate-800/80 grid grid-cols-1 md:grid-cols-12 gap-2 items-end">
                                         <div className="md:col-span-4">
@@ -311,6 +599,10 @@ export const WatchlistScreeningPanel = ({
     );
 };
 
+// ---------------------------------------------------------------------------
+// 4. Four-Eyes Maker-Checker Governance Panel (with Paginated Queue)
+// ---------------------------------------------------------------------------
+
 export const MakerCheckerGovernancePanel = ({
     subjectId,
     subjectName,
@@ -333,6 +625,8 @@ export const MakerCheckerGovernancePanel = ({
     const [bannerError, setBannerError] = useState(null);
     const [bannerSuccess, setBannerSuccess] = useState(null);
     const [showAuditLog, setShowAuditLog] = useState(true);
+    const [queueFilter, setQueueFilter] = useState('undispositioned');
+    const [visibleQueueCount, setVisibleQueueCount] = useState(5);
 
     const caseReview = governanceState?.case_review || { review_state: 'UNREVIEWED' };
     const dispositions = governanceState?.dispositions || {};
@@ -461,9 +755,18 @@ export const MakerCheckerGovernancePanel = ({
         }
     };
 
-    const humanReviewItems = (summary?.requires_human_review || []).filter(
-        item => item.item_type !== 'WATCHLIST_HIT'
-    );
+    const allHumanReviewItems = (summary?.requires_human_review || [])
+        .filter(item => item.item_type !== 'WATCHLIST_HIT')
+        .map((item, idx) => ({
+            ...item,
+            resolvedId: item.finding_id || `review-item-${idx}`,
+        }));
+
+    const undispositionedItems = allHumanReviewItems.filter(item => !dispositions[item.resolvedId]);
+    const filteredQueue = queueFilter === 'undispositioned' && undispositionedItems.length > 0
+        ? undispositionedItems
+        : allHumanReviewItems;
+    const displayedQueue = filteredQueue.slice(0, visibleQueueCount);
 
     return (
         <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm space-y-6">
@@ -490,7 +793,6 @@ export const MakerCheckerGovernancePanel = ({
                     </p>
                 </div>
 
-                {/* Role Switcher for Live Demonstration */}
                 <div className="flex items-center gap-2 bg-slate-950 p-2 rounded-lg border border-slate-800">
                     <Users size={14} className="text-slate-400 ml-1" />
                     <span className="text-[11px] font-semibold text-slate-400">Active Signatory:</span>
@@ -509,7 +811,6 @@ export const MakerCheckerGovernancePanel = ({
                 </div>
             </div>
 
-            {/* Feedback Alerts */}
             {bannerError && (
                 <div className="p-3.5 rounded-xl bg-red-950/50 border border-red-700 text-red-200 text-xs flex items-start gap-2.5">
                     <AlertTriangle size={16} className="text-red-400 shrink-0 mt-0.5" />
@@ -528,95 +829,7 @@ export const MakerCheckerGovernancePanel = ({
                 </div>
             )}
 
-            {/* Per-Item Adverse Media Human-Review Dispositions */}
-            {humanReviewItems.length > 0 && (
-                <div className="space-y-3">
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-amber-300 flex items-center gap-1.5">
-                        <FileCheck size={14} className="text-amber-400" />
-                        Adverse Media Human-Review Queue ({humanReviewItems.length}) — Maker Dispositions
-                    </h3>
-                    <div className="space-y-2.5">
-                        {humanReviewItems.map((item, idx) => {
-                            const itemId = item.finding_id || `review-item-${idx}`;
-                            const existingDisp = dispositions[itemId];
-                            const currentVerdict = itemVerdicts[itemId] || existingDisp?.verdict || 'MITIGATED_ACCEPTABLE';
-                            const currentRationale = itemRationales[itemId] ?? existingDisp?.rationale ?? '';
-
-                            return (
-                                <div key={itemId} className="p-3.5 rounded-lg bg-slate-950/70 border border-slate-800 space-y-2.5">
-                                    <div className="flex items-start justify-between gap-2">
-                                        <div>
-                                            <div className="flex items-center gap-2 flex-wrap">
-                                                <span className="text-xs font-bold text-slate-200">
-                                                    {item.title || item.reason}
-                                                </span>
-                                                <span className="text-[10px] px-2 py-0.5 rounded bg-amber-950/60 text-amber-300 border border-amber-800">
-                                                    {item.reason}
-                                                </span>
-                                                {existingDisp ? (
-                                                    <span className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${verdictBadge(existingDisp.verdict)}`}>
-                                                        Dispositioned: {existingDisp.verdict} (by {existingDisp.maker_email})
-                                                    </span>
-                                                ) : (
-                                                    <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                                                        Pending Maker Disposition
-                                                    </span>
-                                                )}
-                                            </div>
-                                            <p className="text-xs text-slate-400 mt-1">{item.detail}</p>
-                                        </div>
-                                    </div>
-
-                                    <div className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end pt-2 border-t border-slate-800/70">
-                                        <div className="md:col-span-4">
-                                            <select
-                                                disabled={isCaseLocked}
-                                                value={currentVerdict}
-                                                onChange={(e) => setItemVerdicts(prev => ({ ...prev, [itemId]: e.target.value }))}
-                                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
-                                            >
-                                                {DISPOSITION_OPTIONS.map(opt => (
-                                                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                                ))}
-                                            </select>
-                                        </div>
-                                        <div className="md:col-span-6">
-                                            <input
-                                                type="text"
-                                                disabled={isCaseLocked}
-                                                placeholder="Maker assessment rationale (min 10 chars)..."
-                                                value={currentRationale}
-                                                onChange={(e) => setItemRationales(prev => ({ ...prev, [itemId]: e.target.value }))}
-                                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
-                                            />
-                                        </div>
-                                        <div className="md:col-span-2">
-                                            <button
-                                                type="button"
-                                                disabled={isCaseLocked || savingItemId === itemId}
-                                                onClick={() =>
-                                                    handleSaveDisposition({
-                                                        item_id: itemId,
-                                                        item_type: 'FINDING',
-                                                        item_title: item.title || item.reason,
-                                                        verdict: currentVerdict,
-                                                        rationale: currentRationale,
-                                                    })
-                                                }
-                                                className="w-full px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50"
-                                            >
-                                                {savingItemId === itemId ? 'Saving...' : existingDisp ? 'Update' : 'Save'}
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
-                            );
-                        })}
-                    </div>
-                </div>
-            )}
-
-            {/* Two-Column Maker & Checker Workflow Cards */}
+            {/* Two-Column Maker & Checker Workflow Cards (Placed First for Immediate Action) */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                 {/* Step 1: Maker Submission */}
                 <form
@@ -806,6 +1019,139 @@ export const MakerCheckerGovernancePanel = ({
                     </div>
                 </div>
             </div>
+
+            {/* Paginated Per-Item Human-Review Dispositions */}
+            {allHumanReviewItems.length > 0 && (
+                <div className="space-y-3 border-t border-slate-800 pt-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-amber-300 flex items-center gap-1.5">
+                            <FileCheck size={14} className="text-amber-400" />
+                            Human-Review Disposition Queue ({allHumanReviewItems.length - undispositionedItems.length}/{allHumanReviewItems.length} Dispositioned)
+                        </h3>
+                        <div className="flex items-center gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800 text-[11px]">
+                            <button
+                                type="button"
+                                onClick={() => { setQueueFilter('undispositioned'); setVisibleQueueCount(5); }}
+                                className={`px-2.5 py-1 rounded font-semibold ${
+                                    queueFilter === 'undispositioned' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                                }`}
+                            >
+                                Pending ({undispositionedItems.length})
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => { setQueueFilter('all'); setVisibleQueueCount(5); }}
+                                className={`px-2.5 py-1 rounded font-semibold ${
+                                    queueFilter === 'all' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                                }`}
+                            >
+                                All ({allHumanReviewItems.length})
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="space-y-2.5">
+                        {displayedQueue.map((item) => {
+                            const itemId = item.resolvedId;
+                            const existingDisp = dispositions[itemId];
+                            const currentVerdict = itemVerdicts[itemId] || existingDisp?.verdict || 'MITIGATED_ACCEPTABLE';
+                            const currentRationale = itemRationales[itemId] ?? existingDisp?.rationale ?? '';
+
+                            return (
+                                <div key={itemId} className="p-3.5 rounded-lg bg-slate-950/70 border border-slate-800 space-y-2.5">
+                                    <div className="flex items-start justify-between gap-2">
+                                        <div>
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                <span className="text-xs font-bold text-slate-200">
+                                                    {item.title || item.reason}
+                                                </span>
+                                                <span className="text-[10px] px-2 py-0.5 rounded bg-amber-950/60 text-amber-300 border border-amber-800">
+                                                    {item.reason}
+                                                </span>
+                                                {existingDisp ? (
+                                                    <span className={`text-[10px] px-2 py-0.5 rounded border font-semibold ${verdictBadge(existingDisp.verdict)}`}>
+                                                        Dispositioned: {existingDisp.verdict} (by {existingDisp.maker_email})
+                                                    </span>
+                                                ) : (
+                                                    <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+                                                        Pending Maker Disposition
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <p className="text-xs text-slate-400 mt-1">{item.detail}</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end pt-2 border-t border-slate-800/70">
+                                        <div className="md:col-span-4">
+                                            <select
+                                                disabled={isCaseLocked}
+                                                value={currentVerdict}
+                                                onChange={(e) => setItemVerdicts(prev => ({ ...prev, [itemId]: e.target.value }))}
+                                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
+                                            >
+                                                {DISPOSITION_OPTIONS.map(opt => (
+                                                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                        <div className="md:col-span-6">
+                                            <input
+                                                type="text"
+                                                disabled={isCaseLocked}
+                                                placeholder="Maker assessment rationale (min 10 chars)..."
+                                                value={currentRationale}
+                                                onChange={(e) => setItemRationales(prev => ({ ...prev, [itemId]: e.target.value }))}
+                                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
+                                            />
+                                        </div>
+                                        <div className="md:col-span-2">
+                                            <button
+                                                type="button"
+                                                disabled={isCaseLocked || savingItemId === itemId}
+                                                onClick={() =>
+                                                    handleSaveDisposition({
+                                                        item_id: itemId,
+                                                        item_type: 'FINDING',
+                                                        item_title: item.title || item.reason,
+                                                        verdict: currentVerdict,
+                                                        rationale: currentRationale,
+                                                    })
+                                                }
+                                                className="w-full px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50"
+                                            >
+                                                {savingItemId === itemId ? 'Saving...' : existingDisp ? 'Update' : 'Save'}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    {filteredQueue.length > 5 && (
+                        <div className="flex justify-center pt-1">
+                            {visibleQueueCount < filteredQueue.length ? (
+                                <button
+                                    type="button"
+                                    onClick={() => setVisibleQueueCount(prev => prev + 10)}
+                                    className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                                >
+                                    Show More ({filteredQueue.length - visibleQueueCount} remaining)
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={() => setVisibleQueueCount(5)}
+                                    className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700"
+                                >
+                                    Collapse List
+                                </button>
+                            )}
+                        </div>
+                    )}
+                </div>
+            )}
 
             {/* Tamper-Evident SHA-256 Hash-Chained Audit Trail */}
             <div className="border-t border-slate-800 pt-4">
