@@ -1,0 +1,10 @@
+{
+    "subjects": [
+        {
+            "name": "Tesing API User",
+            "company": "Test Corp",
+            "profession": "Tester"
+        }
+    ],
+    "mode": "fresh"
+}

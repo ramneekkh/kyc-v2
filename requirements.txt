@@ -1,0 +1,9 @@
+flask
+google-cloud-spanner
+google-generativeai
+python-dotenv
+requests
+beautifulsoup4
+google-cloud-storage
+google-cloud-pubsub
+gunicorn

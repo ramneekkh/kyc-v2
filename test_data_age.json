@@ -1,0 +1,11 @@
+{
+    "subjects": [
+        {
+            "name": "Mohamad Ali",
+            "age": "50",
+            "profession": "Trader",
+            "company": "Global Import Export"
+        }
+    ],
+    "mode": "fresh"
+}

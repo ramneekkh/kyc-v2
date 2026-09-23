@@ -1,0 +1,175 @@
+# Python virtual environment
+venv/
+env/
+.env/
+.venv/
+.mobile_banking/
+mobile_banking/
+ENV/
+*.pyc
+__pycache__/
+
+# Node modules in any directory
+**/node_modules/
+.env.unversioned
+
+# Auto-generated with sphinx-apidoc
+docs/**/api
+docs/**/_api
+docs/auto-notebooks
+
+# Ignore mermaid-cli artifacts (for docsphinx markdown mermaid)
+node_modules/
+
+# Pytorch model
+*.pt
+*.pt[ch]
+
+# vscode: retain launch.json for sample invocation
+.vscode/*
+!.vscode/launch.json
+
+# Jupyter notebook's checkpoints
+.ipynb_checkpoints
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# MS-Office temporary files
+~$*
+
+# OSX specific
+.DS_Store
+
+# VIM temporary files
+.*.sw[po]
+*.sw[po]
+
+# Python distribution / packaging
+MANIFEST
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+report.xml
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+
+# Flask stuffs
+instance/
+.webassets-cache
+
+# Scrappy stuffs
+.scrapy
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Sphinx documentation
+docs/_build/
+
+# mkdocs documentation
+/site
+
+# Database
+*.db
+*.rdb
+
+# PyBuilder
+target/
+
+# Mypy cache
+.mypy_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.c9/
+.idea/
+.spyproject
+.spyderproject
+.ropeproject
+.vscode
+
+# pyspark
+derby.log
+metastore_db
+spark-warehouse
+**/sample_response/
+**/demo_audio/
+
+experiment/
+*_token.json
+token
+credentials.json
+.env
+fastapi-backend/scripts/init.sh
+
+env
+data
+experiments
+dataset*
+
+instance
+gemini
+filemover.sh

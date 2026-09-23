@@ -1,0 +1,29 @@
+steps:
+  # Step 1: Pull the latest existing image to use as cache source
+  # Use the standard $_IMAGE_NAME substitution passed from deploy.sh
+  # Allow failure (|| exit 0) if the image doesn't exist yet (e.g., first build)
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args: ['-c', 'docker pull ${_IMAGE_NAME} || exit 0']
+    id: PullCache # Give the step an ID
+
+  # Step 2: Build the Docker image using the Dockerfile in the current directory
+  # Tag (-t) the image with the full name provided by $_IMAGE_NAME
+  # Use the potentially pulled image as cache (--cache-from)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_IMAGE_NAME}' # Tag the image with the full name provided by deploy.sh
+      - '--cache-from'
+      - '${_IMAGE_NAME}' # Use the same image name for cache source
+      - '.' # Build context is the current directory (.)
+    id: BuildImage
+    waitFor: ['PullCache'] # Explicitly wait for the cache pull attempt
+
+# List the image(s) to be pushed to Artifact Registry upon successful completion of all build steps.
+# This name MUST exactly match the tag used in the 'docker build -t' step.
+images: ['${_IMAGE_NAME}']
+
+# Optional: Increase default timeout if your build takes longer than 10 minutes
+timeout: 1200s # e.g., 20 minutes
