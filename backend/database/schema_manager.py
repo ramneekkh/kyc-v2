@@ -258,7 +258,12 @@ def apply_schema():
         "CREATE INDEX IDX_Findings_Subject_Url ON Findings (SubjectId, UrlHash)",
         "CREATE INDEX IDX_Findings_Subject_Created ON Findings (SubjectId, CreatedAt DESC)",
         "CREATE INDEX IDX_GraphNodes_SubjectId ON GraphNodes (SubjectId)",
-        "CREATE INDEX IDX_GraphEdges_SubjectId ON GraphEdges (SubjectId)",
+        # GraphEdges has no SubjectId of its own -- an edge is scoped to a
+        # subject transitively, via
+        #   SourceNodeId IN (SELECT NodeId FROM GraphNodes WHERE SubjectId = ?)
+        # so SourceNodeId is the column that subquery probes, and indexing a
+        # SubjectId here simply fails: the column does not exist.
+        "CREATE INDEX IDX_GraphEdges_SourceNodeId ON GraphEdges (SourceNodeId)",
         "CREATE INDEX IDX_Subjects_Name ON Subjects (Name)",
         "CREATE INDEX IDX_Subjects_CustomerId ON Subjects (CustomerId)",
     ]
