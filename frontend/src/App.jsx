@@ -818,20 +818,30 @@ function App() {
 
         const es = new EventSource(`/api/kyc-check?${queryParams.toString()}`);
         eventSourceRef.current = es;
+        let streamedSubjectId = null;
+        let streamCompleted = false;
 
         es.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
 
                 switch (data.status) {
+                    case 'heartbeat':
+                        if (data.subject_id && !streamedSubjectId) {
+                            streamedSubjectId = data.subject_id;
+                            setCurrentSubjectId(data.subject_id);
+                        }
+                        break;
                     case 'subject_initialized':
                         if (data.subject_id) {
+                            streamedSubjectId = data.subject_id;
                             setCurrentSubjectId(data.subject_id);
                         }
                         break;
                     case 'watchlist_results':
                         setWatchlistData(data.data);
                         if (data.subject_id) {
+                            streamedSubjectId = data.subject_id;
                             setCurrentSubjectId(data.subject_id);
                             fetchSubjectGovernance(data.subject_id);
                         }
@@ -865,6 +875,7 @@ function App() {
                             setWatchlistData(data.data.watchlist_screening);
                         }
                         if (data.subject_id) {
+                            streamedSubjectId = data.subject_id;
                             fetchSubjectGovernance(data.subject_id);
                         }
                         setProgress(prev => [...prev, data]);
@@ -876,32 +887,30 @@ function App() {
                     case 'graph_data':
                         setLoadedGraphData(data.data);
                         break;
-                    // Search coverage was degraded but the run continued. Surfaced
-                    // as a persistent banner because it changes how much weight a
-                    // reviewer may place on a "no adverse media" outcome.
                     case 'degraded_coverage':
                         setCoverageAlert({ severity: 'warning', message: data.message });
                         setProgress(prev => [...prev, data]);
                         break;
-                    // The run was abandoned because too little of the intended
-                    // search surface was reachable. This is NOT a clean result.
                     case 'screening_incomplete':
                         setCoverageAlert({ severity: 'critical', message: data.message });
                         setProgress(prev => [...prev, data]);
                         break;
                     case 'complete':
+                        streamCompleted = true;
                         if (data.screening_incomplete) {
                             setCoverageAlert({ severity: 'critical', message: data.message });
                         }
                         if (data.subject_id) {
                             fetchSubjectGovernance(data.subject_id);
                         }
+                        fetch('/api/subjects').then(res => res.json()).then(setSavedSubjects).catch(console.error);
                         setIsSearching(false);
                         es.close();
                         eventSourceRef.current = null;
                         setProgress(prev => [...prev, data]);
                         break;
                     case 'error':
+                        streamCompleted = true;
                         setIsSearching(false);
                         es.close();
                         eventSourceRef.current = null;
@@ -917,9 +926,47 @@ function App() {
         };
 
         es.onerror = (err) => {
-            console.error("EventSource failed:", err);
-            setIsSearching(false);
+            console.warn("EventSource connection interrupted:", err);
             es.close();
+            eventSourceRef.current = null;
+
+            // If the SSE stream dropped mid-run (e.g. proxy idle reset or tab
+            // sleep), the server worker continues persisting findings, summary,
+            // and graph to Spanner. Poll Spanner until completion and hydrate.
+            if (!streamCompleted && streamedSubjectId) {
+                setProgress(prev => [
+                    ...prev,
+                    {
+                        status: 'reconnecting',
+                        message: 'Stream interrupted — syncing completed assessment from Spanner...',
+                    },
+                ]);
+                let attempts = 0;
+                const pollInterval = setInterval(async () => {
+                    attempts += 1;
+                    try {
+                        const res = await fetch(`/api/subjects/${streamedSubjectId}`);
+                        if (res.ok) {
+                            const sData = await res.json();
+                            if (sData?.subject?.summary) {
+                                clearInterval(pollInterval);
+                                setIsSearching(false);
+                                fetch('/api/subjects').then(r => r.json()).then(setSavedSubjects).catch(console.error);
+                                handleLoadSubject(streamedSubjectId);
+                                return;
+                            }
+                        }
+                    } catch (pollErr) {
+                        console.warn("Spanner recovery poll error:", pollErr);
+                    }
+                    if (attempts >= 36) {
+                        clearInterval(pollInterval);
+                        setIsSearching(false);
+                    }
+                }, 4000);
+            } else {
+                setIsSearching(false);
+            }
         };
     };
 

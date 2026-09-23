@@ -191,39 +191,36 @@ class SpannerClient:
         # findings is a list of dicts
         rows = []
         now = datetime.utcnow()
-        for f in findings:
+        import concurrent.futures as _futures
+
+        def _upload_finding_to_gcs(f):
             f_id = f.get("finding_id") or str(uuid.uuid4())
-            
-            # --- GCS Offloading ---
-            gcs_content_uri = None
-            gcs_json_uri = None
-            
+            f["finding_id"] = f_id
             try:
-                # 1. Upload Full Content (Text)
                 if f.get("full_content"):
-                     blob_name_txt = f"findings/{subject_id}/{f_id}_content.txt"
-                     gcs_content_uri = gcs_client.upload_string(f.get("full_content"), blob_name_txt, "text/plain")
-                
-                # 2. Upload Full JSON Data
-                # Ensure we include everything
+                    blob_name_txt = f"findings/{subject_id}/{f_id}_content.txt"
+                    uri_txt = gcs_client.upload_string(
+                        f.get("full_content"), blob_name_txt, "text/plain"
+                    )
+                    if uri_txt:
+                        f["gcs_content_uri"] = uri_txt
                 blob_name_json = f"findings/{subject_id}/{f_id}.json"
-                gcs_json_uri = gcs_client.upload_string(json.dumps(f, indent=2), blob_name_json, "application/json")
-                
+                uri_json = gcs_client.upload_string(
+                    json.dumps(f, indent=2), blob_name_json, "application/json"
+                )
+                if uri_json:
+                    f["gcs_json_uri"] = uri_json
             except Exception as e:
                 logger.error(f"Failed to offload data to GCS for finding {f_id}: {e}")
-                # We continue to save to Spanner, but maybe with missing URIs
+            return f
 
-            # Stash the URIs on the finding itself before serialising. Without
-            # this the RelevanceData blob (which is what get_findings returns and
-            # what the frontend round-trips) has no pointer to the archived
-            # article text, so every export re-scrapes the live web -- slow,
-            # rate-limited, and liable to return different content than what was
-            # actually assessed.
-            f["finding_id"] = f_id
-            if gcs_content_uri:
-                f["gcs_content_uri"] = gcs_content_uri
-            if gcs_json_uri:
-                f["gcs_json_uri"] = gcs_json_uri
+        with _futures.ThreadPoolExecutor(max_workers=16) as gcs_pool:
+            list(gcs_pool.map(_upload_finding_to_gcs, findings))
+
+        for f in findings:
+            f_id = f["finding_id"]
+            gcs_content_uri = f.get("gcs_content_uri")
+            gcs_json_uri = f.get("gcs_json_uri")
 
             rows.append((
                 f_id,

@@ -314,6 +314,8 @@ def _register_api_routes(app: Flask):
              logging.warning(f"Failed to persist subject: {e}")
 
         def generate_events():
+            import queue as _queue
+
             # Tracks whether the run ended in a defensible state. The client must
             # be told explicitly: a silently-closed stream is indistinguishable
             # from a crashed one, and "the spinner stopped" is not a verdict.
@@ -324,43 +326,77 @@ def _register_api_routes(app: Flask):
                 "subject_id": subject_id,
             }
             yield f'data: {json.dumps({"status": "subject_initialized", "subject_id": subject_id, "reviewer": reviewer.to_dict()})}\n\n'
-            try:
-                # Use shared core logic
-                process_generator = run_kyc_process(filters)
-                
-                for event in process_generator:
-                    # Map core events to frontend SSE format
-                    event_type = event.get("type")
-                    if event_type == "status":
-                        if event.get("status") == "screening_incomplete":
-                            outcome["screening_incomplete"] = True
-                            outcome["message"] = event.get("message") or "Screening could not be completed."
-                        yield f'data: {json.dumps({"status": event.get("status"), "message": event.get("message"), "data": event.get("data"), "subject_id": subject_id})}\n\n'
-                    
-                    elif event_type == "watchlist_results":
-                        yield f'data: {json.dumps({"status": "watchlist_results", "message": "Sanctions watchlist screening completed.", "data": event.get("data"), "subject_id": subject_id})}\n\n'
 
-                    elif event_type == "usage_update":
-                        yield f'data: {json.dumps({"status": "usage_update", "data": event.get("data")})}\n\n'
-                        
-                    elif event_type == "result":
-                        yield f'data: {json.dumps({"status": "kyc_result_generated", "message": "Analyzed a source.", "data": event.get("data")})}\n\n'
-                        
-                    elif event_type == "summary":
-                        yield f'data: {json.dumps({"status": "kyc_summary_generated", "message": "Overall assessment complete.", "data": event.get("data"), "subject_id": subject_id})}\n\n'
-                    
-                    elif event_type == "graph_data":
-                        yield f'data: {json.dumps({"status": "kyc_graph_generated", "message": "Entity graph generated.", "data": event.get("data")})}\n\n'
-                
-            except Exception as e:
-                logging.error(f"An error occurred during KYC check stream: {e}", exc_info=True)
-                yield f'data: {json.dumps({"status": "error", "message": "An unexpected error occurred. Please check the logs."})}\n\n'
-                return
+            event_q = _queue.Queue()
+            _SENTINEL = object()
+
+            def _producer():
+                try:
+                    for ev in run_kyc_process(filters):
+                        event_q.put(("event", ev))
+                except Exception as exc:
+                    logging.error(f"An error occurred during KYC check stream: {exc}", exc_info=True)
+                    event_q.put(("error", exc))
+                finally:
+                    event_q.put((_SENTINEL, None))
+
+            producer_thread = threading.Thread(target=_producer, daemon=True)
+            producer_thread.start()
+
+            while True:
+                try:
+                    kind, payload = event_q.get(timeout=8.0)
+                except _queue.Empty:
+                    # Emit an SSE keepalive comment + heartbeat payload every 8s
+                    # during long phases (parallel scraping, GCS archival, Gemini
+                    # map-reduce summary, and graph generation) so Cloud Run IAP /
+                    # GFE and browser HTTP/2 proxies never drop an idle stream.
+                    yield ": keepalive\n\n"
+                    yield f'data: {json.dumps({"status": "heartbeat", "subject_id": subject_id})}\n\n'
+                    continue
+
+                if kind is _SENTINEL:
+                    break
+                if kind == "error":
+                    yield f'data: {json.dumps({"status": "error", "message": "An unexpected error occurred. Please check the logs.", "subject_id": subject_id})}\n\n'
+                    return
+
+                event = payload
+                event_type = event.get("type")
+                if event_type == "status":
+                    if event.get("status") == "screening_incomplete":
+                        outcome["screening_incomplete"] = True
+                        outcome["message"] = event.get("message") or "Screening could not be completed."
+                    yield f'data: {json.dumps({"status": event.get("status"), "message": event.get("message"), "data": event.get("data"), "subject_id": subject_id})}\n\n'
+
+                elif event_type == "watchlist_results":
+                    yield f'data: {json.dumps({"status": "watchlist_results", "message": "Sanctions watchlist screening completed.", "data": event.get("data"), "subject_id": subject_id})}\n\n'
+
+                elif event_type == "usage_update":
+                    yield f'data: {json.dumps({"status": "usage_update", "data": event.get("data")})}\n\n'
+
+                elif event_type == "result":
+                    yield f'data: {json.dumps({"status": "kyc_result_generated", "message": "Analyzed a source.", "data": event.get("data")})}\n\n'
+
+                elif event_type == "summary":
+                    yield f'data: {json.dumps({"status": "kyc_summary_generated", "message": "Overall assessment complete.", "data": event.get("data"), "subject_id": subject_id})}\n\n'
+
+                elif event_type == "graph_data":
+                    yield f'data: {json.dumps({"status": "kyc_graph_generated", "message": "Entity graph generated.", "data": event.get("data")})}\n\n'
+
             # Terminal event. Always sent on a non-error path so the client can
             # distinguish "finished" from "connection dropped mid-screening".
             yield f'data: {json.dumps(outcome)}\n\n'
 
-        return Response(stream_with_context(generate_events()), mimetype='text/event-stream')
+        return Response(
+            stream_with_context(generate_events()),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache, no-transform',
+                'X-Accel-Buffering': 'no',
+                'Connection': 'keep-alive',
+            },
+        )
 
     def _resolve_finding_content(res):
         """
