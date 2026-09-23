@@ -6,6 +6,7 @@ from .database.spanner_client import spanner_client
 from .storage.gcs_client import gcs_client
 from .search.core import run_kyc_process
 from .search.utils import DEFAULT_NUM_QUERIES, DEFAULT_NUM_RESULTS
+from .identity import derive_subject_id, extract_identity_attributes
 
 def process_subject(subj_data, run_mode):
     """
@@ -18,15 +19,27 @@ def process_subject(subj_data, run_mode):
             logging.error("Subject name missing in worker payload")
             return
 
-        # Deterministic ID generation (should match what was used in submission)
-        s_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, s_name))
-        
-        logging.info(f"Worker started for: {s_name} ({s_id}) Mode: {run_mode}")
+        # Reuse the id assigned at submission. Recomputing from the name alone would
+        # silently write this run's findings to a different subject whenever the
+        # submitter keyed on a customer identifier.
+        s_id = (subj_data.get("subject_id") or "").strip()
+        key_strategy = subj_data.get("key_strategy")
+        if not s_id:
+            s_id, key_strategy = derive_subject_id(
+                s_name,
+                customer_id=subj_data.get("customer_id") or subj_data.get("customerId"),
+                attributes=extract_identity_attributes(subj_data),
+            )
+
+        logging.info(f"Worker started for: {s_name} ({s_id}) Mode: {run_mode} Key: {key_strategy}")
 
         # Prepare filters
         s_filters = {
             "subject_name": s_name,
             "subject_id": s_id,
+            "customer_id": subj_data.get("customer_id") or subj_data.get("customerId", ""),
+            "national_id": subj_data.get("national_id", ""),
+            "key_strategy": key_strategy,
             "company": subj_data.get("company", ""),
             "profession": subj_data.get("profession", ""),
             "region": subj_data.get("region", ""),

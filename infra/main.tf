@@ -24,6 +24,7 @@ resource "google_project_service" "apis" {
     "sqladmin.googleapis.com",
     "secretmanager.googleapis.com",
     "iam.googleapis.com",
+    "aiplatform.googleapis.com",
     "generativelanguage.googleapis.com",
     "customsearch.googleapis.com",
     "logging.googleapis.com",
@@ -31,7 +32,8 @@ resource "google_project_service" "apis" {
     "cloudresourcemanager.googleapis.com",
     "spanner.googleapis.com",
     "storage-component.googleapis.com",
-    "pubsub.googleapis.com"
+    "pubsub.googleapis.com",
+    "cloudscheduler.googleapis.com"
   ])
   project                    = var.project_id
   service                    = each.key
@@ -88,8 +90,7 @@ resource "google_pubsub_topic" "kyc_jobs" {
   depends_on = [google_project_service.apis["pubsub.googleapis.com"]]
 }
 
-# --- Secret Manager ---
-
+# --- Secret Manager (Non-ADC Secrets: Search Engine ID, Search Engine API Key, ScrapingBee Key) ---
 
 resource "google_secret_manager_secret" "google_api_key" {
   provider  = google
@@ -104,6 +105,22 @@ resource "google_secret_manager_secret" "google_api_key" {
 resource "google_secret_manager_secret_version" "google_api_key_version" {
   provider    = google
   secret      = google_secret_manager_secret.google_api_key.id
+  secret_data = var.google_api_key
+}
+
+resource "google_secret_manager_secret" "google_search_api_key" {
+  provider  = google
+  project   = var.project_id
+  secret_id = "GOOGLE_SEARCH_API_KEY"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis["secretmanager.googleapis.com"]]
+}
+
+resource "google_secret_manager_secret_version" "google_search_api_key_version" {
+  provider    = google
+  secret      = google_secret_manager_secret.google_search_api_key.id
   secret_data = var.google_api_key
 }
 
@@ -123,22 +140,43 @@ resource "google_secret_manager_secret_version" "google_cse_id_version" {
   secret_data = var.google_cse_id
 }
 
+resource "google_secret_manager_secret" "sb_api_key" {
+  provider  = google
+  project   = var.project_id
+  secret_id = "SB_API_KEY"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis["secretmanager.googleapis.com"]]
+}
+
+resource "google_secret_manager_secret_version" "sb_api_key_version" {
+  provider    = google
+  secret      = google_secret_manager_secret.sb_api_key.id
+  secret_data = var.sb_api_key
+}
+
 # --- IAM Permissions ---
 data "google_project" "project" {}
-
-# We are no longer creating a dedicated service account. We will grant permissions
-# to the Compute Engine default service account, which Cloud Run uses by default.
 
 resource "google_secret_manager_secret_iam_member" "secret_accessor" {
   for_each = toset([
     google_secret_manager_secret.google_api_key.secret_id,
-    google_secret_manager_secret.google_cse_id.secret_id
+    google_secret_manager_secret.google_search_api_key.secret_id,
+    google_secret_manager_secret.google_cse_id.secret_id,
+    google_secret_manager_secret.sb_api_key.secret_id
   ])
   project   = var.project_id
   secret_id = each.key
   role      = "roles/secretmanager.secretAccessor"
   # Granting permission to the Compute Engine default SA, which Cloud Run will use
   member    = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+}
+
+resource "google_project_iam_member" "vertex_ai_user" {
+  project = var.project_id
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
 }
 
 resource "google_project_iam_member" "spanner_user" {
@@ -177,6 +215,60 @@ resource "google_project_iam_member" "pubsub_invoker" {
   project = var.project_id
   role    = "roles/run.invoker"
   member  = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
+
+# --- Perpetual KYC (pKYC) monitoring sweep ---------------------------------
+#
+# Ongoing monitoring runs as an external Cloud Scheduler job, NOT as an
+# in-process APScheduler. Under `gunicorn -w N` an in-process scheduler runs
+# once per worker, so the same subjects were re-screened N times per tick and
+# the schedule died silently whenever the container was scaled to zero. An
+# external trigger also gives us retries, an audit trail of every invocation,
+# and a schedule that survives deploys -- all of which an examiner will ask for.
+
+resource "google_service_account" "scheduler_invoker" {
+  project      = var.project_id
+  account_id   = "kyc-scheduler-invoker"
+  display_name = "KYC pKYC scheduler invoker"
+  description  = "Identity Cloud Scheduler uses to call the pKYC sweep endpoint."
+}
+
+resource "google_cloud_run_service_iam_member" "scheduler_invoker" {
+  project  = var.project_id
+  location = var.gcp_region
+  service  = var.app_service_name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.scheduler_invoker.email}"
+}
+
+resource "google_cloud_scheduler_job" "pkyc_sweep" {
+  project     = var.project_id
+  region      = var.gcp_region
+  name        = "kyc-pkyc-sweep"
+  description = "Enqueues an incremental re-screen for every subject whose monitoring interval has elapsed."
+  schedule    = var.pkyc_schedule
+  time_zone   = var.pkyc_schedule_timezone
+
+  # The endpoint publishes to Pub/Sub and returns quickly; it does not screen inline.
+  attempt_deadline = "320s"
+
+  retry_config {
+    retry_count          = 3
+    min_backoff_duration = "30s"
+    max_backoff_duration = "300s"
+  }
+
+  http_target {
+    http_method = "POST"
+    uri         = "${var.service_url}/api/tasks/pkyc-sweep"
+
+    oidc_token {
+      service_account_email = google_service_account.scheduler_invoker.email
+      audience              = var.service_url
+    }
+  }
+
+  depends_on = [google_project_service.apis]
 }
 
 

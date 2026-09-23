@@ -4,6 +4,10 @@ load_dotenv()
 import logging
 import uuid
 import os
+import re
+import threading
+
+from ..identity import content_fingerprint
 import json
 from datetime import datetime
 
@@ -15,6 +19,40 @@ except ImportError:
 from ..storage.gcs_client import gcs_client
 
 logger = logging.getLogger(__name__)
+
+def _coerce_timestamp(value):
+    """Coerces an ISO-8601 string (or datetime) to a datetime for Spanner.
+
+    Findings travel through the pipeline as JSON-serialisable dicts, so
+    timestamps are carried as ISO strings. Spanner TIMESTAMP columns want real
+    datetimes, and a malformed value must not take down the whole batch.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning(f"Unparseable timestamp {value!r}; storing NULL.")
+            return None
+    return None
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    """Total int coercion; the model sometimes returns "N/A" or a float for scores."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        m = re.search(r"-?\d+", value)
+        if m:
+            try:
+                return int(m.group())
+            except ValueError:
+                return default
+    return default
+
 
 class SpannerClient:
     def __init__(self):
@@ -39,7 +77,9 @@ class SpannerClient:
 
         self.instance = None
         self.database = None
-    
+        self._dialect = None
+        self._dialect_lock = threading.Lock()
+
     def connect(self):
         """Lazy connection to ensure fork safety with Gunicorn."""
         if self.database:
@@ -61,6 +101,29 @@ class SpannerClient:
         except Exception as e:
             logger.error(f"Failed to connect SpannerClient: {e}")
             self.client = None
+
+    def _get_dialect(self):
+        """
+        Returns the database dialect, fetched once per process.
+
+        Every read path used to call `self.database.reload()` first. That is an
+        admin-API call (UpdateDatabaseDdl surface), which Spanner throttles at a far
+        lower rate than data reads - roughly 5 QPS. Under load the admin quota, not
+        the database, became the bottleneck, and reload failures surfaced as read
+        failures. The dialect cannot change at runtime, so one lookup suffices.
+        """
+        if self._dialect is not None:
+            return self._dialect
+        with self._dialect_lock:
+            if self._dialect is not None:
+                return self._dialect
+            try:
+                self.database.reload()
+                self._dialect = self.database.database_dialect
+            except Exception as e:
+                logger.warning(f"Could not determine Spanner dialect ({e}); assuming GoogleSQL.")
+                self._dialect = None
+            return self._dialect
 
     def _get_timestamp(self):
         return datetime.utcnow()
@@ -85,9 +148,9 @@ class SpannerClient:
             if not exists:
                 transaction.insert(
                     "Subjects",
-                    columns=["SubjectId", "Name", "ProfileData", "Status", "CreatedAt", "UpdatedAt"],
+                    columns=["SubjectId", "UserId", "Name", "ProfileData", "Status", "CreatedAt", "UpdatedAt"],
                     values=[
-                        (subject_id, name, json.dumps(profile_data), "ACTIVE", now, now)
+                        (subject_id, "system", name, json.dumps(profile_data), "ACTIVE", now, now)
                     ]
                 )
             else:
@@ -150,14 +213,26 @@ class SpannerClient:
                 logger.error(f"Failed to offload data to GCS for finding {f_id}: {e}")
                 # We continue to save to Spanner, but maybe with missing URIs
 
+            # Stash the URIs on the finding itself before serialising. Without
+            # this the RelevanceData blob (which is what get_findings returns and
+            # what the frontend round-trips) has no pointer to the archived
+            # article text, so every export re-scrapes the live web -- slow,
+            # rate-limited, and liable to return different content than what was
+            # actually assessed.
+            f["finding_id"] = f_id
+            if gcs_content_uri:
+                f["gcs_content_uri"] = gcs_content_uri
+            if gcs_json_uri:
+                f["gcs_json_uri"] = gcs_json_uri
+
             rows.append((
                 f_id,
                 subject_id,
-                f.get("link"),
-                f.get("title"),
+                f.get("url") or f.get("link"),
+                f.get("source_title") or f.get("title"),
                 f.get("snippet"),
                 f.get("risk_level"),
-                int(f.get("relevance_score", 0)),
+                _coerce_int(f.get("relevance_score")),
                 json.dumps(f), # Still keep JSON in Spanner, but it might be truncated by DB if huge? 
                                # Spanner JSON/JSONB limit is high (10MB/doc usu), so maybe OK. 
                                # But Findings table definition for RelevanceData is JSONB.
@@ -168,18 +243,35 @@ class SpannerClient:
                 f.get("parent_finding_id"),
                 gcs_content_uri,
                 gcs_json_uri,
+                # Materiality is stored as discrete columns, not buried in the JSON
+                # blob, so the review queue can be rebuilt without re-parsing every row.
+                _coerce_int(f.get("identity_confidence")),
+                _coerce_int(f.get("risk_severity")),
+                f.get("match_status"),
+                f.get("analysis_status"),
+                bool(f.get("content_available", False)),
+                content_fingerprint(f.get("full_content")),
+                _coerce_timestamp(f.get("content_changed_at")),
                 now
             ))
         
         try:
             with self.database.batch() as batch:
-                batch.insert(
+                # insert_or_update, not insert: when an article's content changes
+                # under a stable URL we deliberately re-analyse it and rewrite the
+                # SAME FindingId. Two contradictory rows for one URL would be worse
+                # than useless to a reviewer, and a plain insert would throw
+                # ALREADY_EXISTS and silently drop the corrected assessment.
+                batch.insert_or_update(
                     "Findings",
                     columns=[
                         "FindingId", "SubjectId", "Url", "Title", "Snippet", 
                         "RiskLevel", "Score", "RelevanceData", "FullContent", 
                         "UrlHash", "ContentHash", "IsSyndicated", "ParentFindingId", 
                         "GcsContentUri", "GcsJsonUri",
+                        "IdentityConfidence", "RiskSeverity", "MatchStatus",
+                        "AnalysisStatus", "ContentAvailable", "ContentFingerprint",
+                        "ContentChangedAt",
                         "CreatedAt"
                     ],
                     values=rows
@@ -189,15 +281,26 @@ class SpannerClient:
             logger.error(f"Error saving findings batch: {e}")
 
     def get_existing_hashes_and_ids(self, subject_id):
-        """Retrieves FindingId, UrlHash, ContentHash for deduplication."""
+        """Retrieves FindingId, UrlHash, ContentHash and ContentFingerprint for deduplication.
+
+        Returns:
+            (url_hashes, content_hashes, url_fingerprints) where
+              url_hashes:      {url_hash: finding_id}
+              content_hashes:  {finding_id: content_hash}
+              url_fingerprints:{url_hash: content_fingerprint}
+
+        The third dict exists so the pipeline can tell "we have already seen this
+        URL" apart from "we have already seen this URL *with this content*".
+        Publishers routinely amend or retract stories in place without changing
+        the URL; URL-only dedup would pin the original, now-wrong assessment.
+        """
         self.connect()
-        if not self.database: return {}, {}
+        if not self.database: return {}, {}, {}
         
         try:
             with self.database.snapshot() as snapshot:
                 # Check dialect
-                self.database.reload()
-                dialect = self.database.database_dialect
+                dialect = self._get_dialect()
                 is_pg = False
                 try:
                     is_pg = (dialect == 2) or "POSTGRESQL" in getattr(dialect, 'name', str(dialect)).upper()
@@ -205,11 +308,11 @@ class SpannerClient:
                     is_pg = (dialect == 2)
                 
                 if is_pg:
-                    query = "SELECT FindingId, UrlHash, ContentHash FROM Findings WHERE SubjectId = $1"
+                    query = "SELECT FindingId, UrlHash, ContentHash, ContentFingerprint FROM Findings WHERE SubjectId = $1"
                     params = {"p1": subject_id}
                     p_types = {"p1": spanner.param_types.STRING}
                 else:
-                    query = "SELECT FindingId, UrlHash, ContentHash FROM Findings WHERE SubjectId = @subject_id"
+                    query = "SELECT FindingId, UrlHash, ContentHash, ContentFingerprint FROM Findings WHERE SubjectId = @subject_id"
                     params = {"subject_id": subject_id}
                     p_types = {"subject_id": spanner.param_types.STRING}
 
@@ -217,20 +320,23 @@ class SpannerClient:
                 
                 url_hashes = {}
                 content_hashes = {}
+                url_fingerprints = {}
                 
                 for row in results:
                     fid = row[0]
                     u_hash = row[1]
                     c_hash = row[2]
+                    fingerprint = row[3] if len(row) > 3 else None
                     
                     if u_hash: url_hashes[u_hash] = fid
                     if c_hash: content_hashes[fid] = c_hash # Store content hash by FID for hydration
+                    if u_hash and fingerprint: url_fingerprints[u_hash] = fingerprint
                     
-                return url_hashes, content_hashes
+                return url_hashes, content_hashes, url_fingerprints
 
         except Exception as e:
             logger.error(f"Error fetching existing hashes for {subject_id}: {e}")
-            return {}, {}
+            return {}, {}, {}
 
     def save_graph_data(self, subject_id, nodes, edges):
         self.connect()
@@ -257,12 +363,29 @@ class SpannerClient:
             ))
 
         edge_rows = []
+        # GraphEdges has foreign keys onto GraphNodes. The model routinely emits an
+        # edge referencing an entity it never declared as a node, which violates the
+        # constraint and - because nodes and edges shared one batch - rolled back the
+        # ENTIRE graph. The broad except then swallowed it, so the graph simply never
+        # appeared and nothing indicated why. Dangling edges are now dropped and
+        # counted instead of destroying the commit.
+        valid_node_pks = {row[0] for row in node_rows}
+        dropped_edges = 0
         for e in edges:
             # Edges source/target must match the hashed Node IDs
             from_pk = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{subject_id}_{str(e.get('from'))}"))
             to_pk = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{subject_id}_{str(e.get('to'))}"))
+
+            if from_pk not in valid_node_pks or to_pk not in valid_node_pks:
+                dropped_edges += 1
+                logger.warning(
+                    "Dropping graph edge with unknown endpoint: %s -> %s (%s)",
+                    e.get('from'), e.get('to'), e.get('label'),
+                )
+                continue
+
             edge_pk = str(uuid.uuid4()) # Edges are unique events usually
-            
+
             edge_rows.append((
                 edge_pk,
                 from_pk,
@@ -273,21 +396,53 @@ class SpannerClient:
                 now
             ))
 
+        if dropped_edges:
+            logger.warning(
+                f"Dropped {dropped_edges} of {len(edges)} graph edges for subject "
+                f"{subject_id} because their endpoints were not declared as nodes."
+            )
+
+        # Nodes commit first and independently: a node set is useful on its own, and
+        # an edge-level failure must not take the nodes down with it.
+        nodes_saved = False
         try:
-            with self.database.batch() as batch:
-                batch.insert_or_update(
-                    "GraphNodes",
-                    columns=["NodeId", "SubjectId", "Label", "Type", "Properties", "CreatedAt"],
-                    values=node_rows
-                )
-                batch.insert_or_update(
-                    "GraphEdges",
-                    columns=["EdgeId", "SourceNodeId", "TargetNodeId", "Label", "Year", "Properties", "CreatedAt"],
-                    values=edge_rows
-                )
-            logger.info(f"Saved graph data: {len(node_rows)} nodes, {len(edge_rows)} edges.")
+            if node_rows:
+                with self.database.batch() as batch:
+                    batch.insert_or_update(
+                        "GraphNodes",
+                        columns=["NodeId", "SubjectId", "Label", "Type", "Properties", "CreatedAt"],
+                        values=node_rows
+                    )
+                nodes_saved = True
+                logger.info(f"Saved {len(node_rows)} graph nodes.")
         except Exception as e:
-            logger.error(f"Error saving graph data: {e}")
+            logger.error(f"Error saving graph nodes: {e}")
+
+        if edge_rows and (nodes_saved or not node_rows):
+            try:
+                with self.database.batch() as batch:
+                    batch.insert_or_update(
+                        "GraphEdges",
+                        columns=["EdgeId", "SourceNodeId", "TargetNodeId", "Label", "Year", "Properties", "CreatedAt"],
+                        values=edge_rows
+                    )
+                logger.info(f"Saved {len(edge_rows)} graph edges.")
+            except Exception as e:
+                # Retry edge-by-edge so one bad row cannot cost the whole edge set.
+                logger.warning(f"Batch edge insert failed ({e}); retrying individually.")
+                saved = 0
+                for row in edge_rows:
+                    try:
+                        with self.database.batch() as batch:
+                            batch.insert_or_update(
+                                "GraphEdges",
+                                columns=["EdgeId", "SourceNodeId", "TargetNodeId", "Label", "Year", "Properties", "CreatedAt"],
+                                values=[row]
+                            )
+                        saved += 1
+                    except Exception as row_err:
+                        logger.error(f"Skipping unsaveable graph edge {row[0]}: {row_err}")
+                logger.info(f"Saved {saved} of {len(edge_rows)} graph edges individually.")
 
     def get_all_subjects(self):
         self.connect()
@@ -363,8 +518,7 @@ class SpannerClient:
                 # So we must use SQL.
                 
                 # Check dialect to form query
-                self.database.reload()
-                dialect = self.database.database_dialect
+                dialect = self._get_dialect()
                 is_pg = False
                 try:
                     if isinstance(dialect, int): is_pg = (dialect == 2)
@@ -424,8 +578,7 @@ class SpannerClient:
                 
                 # Check dialect again? Or assume standard scan. 
                 # Let's use SQL for consistency with get_findings
-                self.database.reload()
-                dialect = self.database.database_dialect
+                dialect = self._get_dialect()
                 is_pg = False
                 try:
                     if isinstance(dialect, int): is_pg = (dialect == 2)
@@ -520,8 +673,7 @@ class SpannerClient:
                 # For small scale, a scan or "SELECT * FROM Subjects WHERE Name = @name" is okay.
                 
                 # Check dialect
-                self.database.reload()
-                dialect = self.database.database_dialect
+                dialect = self._get_dialect()
                 is_pg = False
                 try:
                     is_pg = (dialect == 2) or "POSTGRESQL" in getattr(dialect, 'name', str(dialect)).upper()
@@ -569,8 +721,7 @@ class SpannerClient:
                 # Just use simple SQL
                 
                  # Check dialect
-                self.database.reload()
-                dialect = self.database.database_dialect
+                dialect = self._get_dialect()
                 is_pg = False
                 try:
                     is_pg = (dialect == 2) or "POSTGRESQL" in getattr(dialect, 'name', str(dialect)).upper()
@@ -613,8 +764,7 @@ class SpannerClient:
         try:
             with self.database.snapshot() as snapshot:
                 # Dialect check
-                self.database.reload()
-                dialect = self.database.database_dialect
+                dialect = self._get_dialect()
                 is_pg = False
                 try:
                     is_pg = (dialect == 2) or "POSTGRESQL" in getattr(dialect, 'name', str(dialect)).upper()

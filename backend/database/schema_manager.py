@@ -173,8 +173,8 @@ def apply_schema():
         logger.error(f"Error applying schema: {e}")
         # Allow proceeding to migration steps
     
-    # 2. Migration: Add FullContent and Summary columns if they don't exist
-    logger.info("Running schema migration (Adding FullContent/Summary)...")
+    # 2. Migration: additive columns
+    logger.info("Running schema migration (additive columns)...")
     migration_statements = []
     if is_pg:
         migration_statements = [
@@ -185,8 +185,27 @@ def apply_schema():
             "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS ParentFindingId text",
             "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS GcsContentUri text",
             "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS GcsJsonUri text",
+            # Two-dimensional materiality (see backend/search/utils.py)
+            "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS IdentityConfidence bigint",
+            "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS RiskSeverity bigint",
+            "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS MatchStatus text",
+            "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS AnalysisStatus text",
+            "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS ContentAvailable boolean",
+            # Detects an article edited in place under an unchanged URL
+            "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS ContentFingerprint text",
+            "ALTER TABLE Findings ADD COLUMN IF NOT EXISTS ContentChangedAt timestamptz",
             "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS Summary text",
-            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS UserId varchar(128)"
+            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS UserId varchar(128)",
+            # Identity + audit
+            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS CustomerId varchar(128)",
+            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS TenantId varchar(128)",
+            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS KeyStrategy varchar(64)",
+            # Summary regeneration debounce
+            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS SummaryStatus varchar(32)",
+            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS SummaryAttempts bigint DEFAULT 0",
+            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS LastSummaryAttemptAt timestamptz",
+            # Retention: when this subject's findings become eligible for purge
+            "ALTER TABLE Subjects ADD COLUMN IF NOT EXISTS RetainUntil timestamptz",
         ]
     else:
         # GoogleSQL does not support IF NOT EXISTS in ALTER TABLE usually, but we tolerate errors
@@ -198,10 +217,24 @@ def apply_schema():
             "ALTER TABLE Findings ADD COLUMN ParentFindingId STRING(36)",
             "ALTER TABLE Findings ADD COLUMN GcsContentUri STRING(MAX)",
             "ALTER TABLE Findings ADD COLUMN GcsJsonUri STRING(MAX)",
+            "ALTER TABLE Findings ADD COLUMN IdentityConfidence INT64",
+            "ALTER TABLE Findings ADD COLUMN RiskSeverity INT64",
+            "ALTER TABLE Findings ADD COLUMN MatchStatus STRING(32)",
+            "ALTER TABLE Findings ADD COLUMN AnalysisStatus STRING(32)",
+            "ALTER TABLE Findings ADD COLUMN ContentAvailable BOOL",
+            "ALTER TABLE Findings ADD COLUMN ContentFingerprint STRING(64)",
+            "ALTER TABLE Findings ADD COLUMN ContentChangedAt TIMESTAMP",
             "ALTER TABLE Subjects ADD COLUMN Summary STRING(MAX)",
-            "ALTER TABLE Subjects ADD COLUMN UserId STRING(128)"
+            "ALTER TABLE Subjects ADD COLUMN UserId STRING(128)",
+            "ALTER TABLE Subjects ADD COLUMN CustomerId STRING(128)",
+            "ALTER TABLE Subjects ADD COLUMN TenantId STRING(128)",
+            "ALTER TABLE Subjects ADD COLUMN KeyStrategy STRING(64)",
+            "ALTER TABLE Subjects ADD COLUMN SummaryStatus STRING(32)",
+            "ALTER TABLE Subjects ADD COLUMN SummaryAttempts INT64",
+            "ALTER TABLE Subjects ADD COLUMN LastSummaryAttemptAt TIMESTAMP",
+            "ALTER TABLE Subjects ADD COLUMN RetainUntil TIMESTAMP",
         ]
-        
+
     for stmt in migration_statements:
         try:
             op = database.update_ddl([stmt])
@@ -212,6 +245,36 @@ def apply_schema():
                 logger.info(f"Column already exists: {stmt}")
             else:
                 logger.warning(f"Migration failed for {stmt}: {e}")
+
+    # 3. Secondary indexes.
+    #
+    # Every query in spanner_client.py filters on SubjectId, yet SubjectId was not
+    # the primary key of Findings, GraphNodes or GraphEdges and had no index. Each
+    # "show me this subject's findings" therefore scanned the entire table, so read
+    # latency grew with the size of the whole corpus rather than with the subject.
+    # Subjects.Name is indexed because get_subject_by_name sits on the hot path.
+    index_statements = [
+        "CREATE INDEX IDX_Findings_SubjectId ON Findings (SubjectId)",
+        "CREATE INDEX IDX_Findings_Subject_Url ON Findings (SubjectId, UrlHash)",
+        "CREATE INDEX IDX_Findings_Subject_Created ON Findings (SubjectId, CreatedAt DESC)",
+        "CREATE INDEX IDX_GraphNodes_SubjectId ON GraphNodes (SubjectId)",
+        "CREATE INDEX IDX_GraphEdges_SubjectId ON GraphEdges (SubjectId)",
+        "CREATE INDEX IDX_Subjects_Name ON Subjects (Name)",
+        "CREATE INDEX IDX_Subjects_CustomerId ON Subjects (CustomerId)",
+    ]
+
+    logger.info("Creating secondary indexes...")
+    for stmt in index_statements:
+        try:
+            op = database.update_ddl([stmt])
+            op.result(timeout=300)
+            logger.info(f"Executed: {stmt}")
+        except Exception as e:
+            msg = str(e)
+            if "already exists" in msg or "Duplicate name" in msg:
+                logger.info(f"Index already exists: {stmt}")
+            else:
+                logger.warning(f"Index creation failed for {stmt}: {e}")
 
 if __name__ == "__main__":
     # Load env vars manually if running as script (or assume environment is set)

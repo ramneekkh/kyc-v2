@@ -13,15 +13,28 @@ from .utils import (
     extract_profile_data_with_gemini,
     DEFAULT_NUM_QUERIES,
 )
+from ..ai_client import DEFAULT_GEMINI_MODEL
+from .screening import (
+    RECOMMENDATION_NO_ADVERSE_MEDIA,
+    SearchCoverage,
+    incomplete_screening_summary,
+)
 from .deduplication import SyndicationFilter
 from .prompts import KYC_SEARCH_QUERY_BRAINSTORMING_PROMPT
 from ..database.spanner_client import spanner_client
 
-# Hard-coded Priority Query Templates (Duplicates of app.py for now, should centralize)
+# Priority adverse-media query templates.
+#
+# NOTE: these are ADVERSE MEDIA queries. They are not, and cannot be, a substitute
+# for structured sanctions/PEP list screening against OFAC, UN, EU, HMT or MAS
+# lists. See the capability gap noted in the review.
 PRIORITY_QUERY_TEMPLATES = [
     '"{subject_name}" AND (launder* OR terror* OR fraud OR corrupt* OR brib* OR traffick* OR "tax evasion" OR arrest* OR embezzle* OR illegal OR "insider deal" OR sanctions OR "sanctions evasion")',
     '"{subject_name}" AND (crime OR investigat* OR alleg* OR convict* OR sentenced OR lawsuit OR litigation OR misdemeanor* OR offen* OR prosecut* OR scam* OR "tax amnesty")',
-    '"{subject_name}" AND (DPRK OR "Democratic People’s Republic of Korea" OR "North Korea" OR Iran OR Cuba OR Syria OR Crimea OR Donetsk OR Luhansk OR Kherson OR Zaporizhzhia OR Russia OR Venezuela OR Burma OR Myanmar OR Belarus)'
+    # Sanctions NEXUS, not geography. The previous version was a bare OR-list of
+    # country names, so every article that merely mentioned Russia or Iran scored as
+    # a sanctions hit. Each jurisdiction is now paired with a sanctions-related term.
+    '"{subject_name}" AND ("sanctions evasion" OR "sanctioned entity" OR "designated person" OR "asset freeze" OR "export control" OR "dual-use goods" OR OFAC OR "SDN list" OR "restricted party") AND (DPRK OR "North Korea" OR Iran OR Cuba OR Syria OR Crimea OR Donetsk OR Luhansk OR Russia OR Venezuela OR Myanmar OR Belarus)',
 ]
 
 def run_kyc_process(filters):
@@ -80,8 +93,17 @@ def run_kyc_process(filters):
     yield {"type": "status", "status": "performing_priority_searches", "message": f"Performing {len(PRIORITY_QUERY_TEMPLATES)} priority searches..."}
     
     priority_queries = [q.format(subject_name=subject_name) for q in PRIORITY_QUERY_TEMPLATES]
-    priority_search_results = perform_google_web_searches(priority_queries, filters['num_results'], filters['recency_days'])
-    
+    priority_search_results, priority_coverage = perform_google_web_searches(
+        priority_queries, filters['num_results'], filters['recency_days']
+    )
+
+    if not priority_coverage.is_complete:
+        yield {
+            "type": "status",
+            "status": "degraded_coverage",
+            "message": f"Priority search degraded: {priority_coverage.describe()}",
+        }
+
     # Deduplicate priority results against DB
     if incremental_mode:
         original_count = len(priority_search_results)
@@ -94,9 +116,6 @@ def run_kyc_process(filters):
 
     yield {"type": "status", "status": "analyzing_priority_results", "message": f"Found {len(priority_search_results)} new priority sources."}
 
-    # 2. Gemini Generated Searches
-
-
     # 2. Brainstorming / Gemini Queries (Run for both New and Incremental, applying filters)
     yield {"type": "status", "status": "brainstorming", "message": "Brainstorming additional search angles..."}
     gemini_queries, query_usage = generate_search_queries_with_gemini(filters, KYC_SEARCH_QUERY_BRAINSTORMING_PROMPT)
@@ -105,20 +124,32 @@ def run_kyc_process(filters):
     if query_usage:
         session_usage["input_tokens"] += query_usage.get('input_tokens', 0)
         session_usage["output_tokens"] += query_usage.get('output_tokens', 0)
-        cost = calculate_cost('gemini-1.5-flash', query_usage.get('input_tokens', 0), query_usage.get('output_tokens', 0))
+        cost = calculate_cost(DEFAULT_GEMINI_MODEL, query_usage.get('input_tokens', 0), query_usage.get('output_tokens', 0))
         session_usage["cost"] += cost
         yield {"type": "usage_update", "data": session_usage}
     
+    # Enforce the diligence-tier query budget in code. The prompt asks for
+    # exactly this many, but a prompt is a request, not a control: an
+    # over-generating model would otherwise silently blow through the search
+    # quota and starve later subjects in the same pKYC sweep. The model is told
+    # to rank most-informative first, so truncation drops the weakest tail.
+    query_budget = int(filters.get('num_queries') or DEFAULT_NUM_QUERIES)
+    if gemini_queries and len(gemini_queries) > query_budget:
+        logging.info(
+            f"Truncating {len(gemini_queries)} generated queries to the "
+            f"tier budget of {query_budget}."
+        )
+        gemini_queries = gemini_queries[:query_budget]
+
+    gemini_coverage = SearchCoverage()
     if gemini_queries:
-        if incremental_mode:
-             # In incremental mode, we trust the recency_days calculated above.
-             pass 
-        
         yield {"type": "status", "status": "queries_generated", "message": f"Generated {len(gemini_queries)} queries.", "data": gemini_queries}
         yield {"type": "status", "status": "performing_distributed_searches", "message": "Performing distributed searches..."}
         
         # recency_days is already set based on last_run if incremental
-        gemini_search_results = perform_google_web_searches(gemini_queries, filters['num_results'], filters['recency_days'])
+        gemini_search_results, gemini_coverage = perform_google_web_searches(
+            gemini_queries, filters['num_results'], filters['recency_days']
+        )
         
         # Deduplicate generic results against DB (URLs)
         if existing_urls:
@@ -126,12 +157,54 @@ def run_kyc_process(filters):
     else:
          gemini_search_results = []
 
+    total_coverage = priority_coverage.merge(gemini_coverage)
+
     # 3. Combine Results
     priority_results_dict = {res['link']: res for res in priority_search_results}
     gemini_results_dict = {res['link']: res for res in gemini_search_results if res['link'] not in priority_results_dict}
     all_search_results = list(priority_results_dict.values()) + list(gemini_results_dict.values())
 
     if not all_search_results:
+        # CRITICAL: zero results is ambiguous. It means either "this subject is clean"
+        # or "we never reached the search API". Only coverage can tell them apart, and
+        # conflating them is how a sanctioned party gets onboarded.
+        if not total_coverage.is_complete:
+            summary_data = incomplete_screening_summary(subject_name, total_coverage)
+            logging.error(
+                f"Screening for '{subject_name}' returned no results with degraded coverage: "
+                f"{total_coverage.describe()} Refusing to report a clean result."
+            )
+            if subject_id:
+                try:
+                    spanner_client.update_subject_summary(subject_id, json.dumps(summary_data))
+                except Exception as e:
+                    logging.error(f"Failed to persist incomplete-screening summary: {e}")
+            yield {"type": "summary", "data": summary_data}
+            yield {
+                "type": "status",
+                "status": "screening_incomplete",
+                "message": f"Screening could not be completed. {total_coverage.describe()}",
+            }
+            return
+
+        summary_data = {
+            "risk_score": "Low",
+            "summary": (
+                f"No adverse media was identified for {subject_name} in this open-source scan. "
+                f"{total_coverage.describe()} This reflects the sources searched in this run only."
+            ),
+            "key_findings": [],
+            "requires_human_review": [],
+            "recommendation": RECOMMENDATION_NO_ADVERSE_MEDIA,
+            "reasoning": "No adverse media returned by the sources searched.",
+            "screening_coverage": total_coverage.to_dict(),
+        }
+        if subject_id:
+            try:
+                spanner_client.update_subject_summary(subject_id, json.dumps(summary_data))
+            except Exception as e:
+                logging.error(f"Failed to persist clean summary: {e}")
+        yield {"type": "summary", "data": summary_data}
         yield {"type": "status", "status": "complete", "message": "No articles found."}
         return
 
@@ -147,14 +220,19 @@ def run_kyc_process(filters):
     # Load previous findings and hashes for ALL modes to ensure deduplication and full graph context
     previous_findings = spanner_client.get_findings(subject_id)
     existing_url_hashes = {}
+    existing_url_fingerprints = {}
     syndication_filter = SyndicationFilter()
     
     yield {"type": "status", "status": "context_loading", "message": f"Loaded {len(previous_findings)} existing findings for context."}
     
     try:
-        u_hashes, c_hashes = spanner_client.get_existing_hashes_and_ids(subject_id)
+        u_hashes, c_hashes, u_fingerprints = spanner_client.get_existing_hashes_and_ids(subject_id)
         syndication_filter.preload_hashes(c_hashes)
         existing_url_hashes = u_hashes
+        # Fingerprints let the analyzer distinguish "seen this URL" from
+        # "seen this URL with this content", so amended or retracted stories
+        # are re-assessed instead of inheriting a stale verdict.
+        existing_url_fingerprints = u_fingerprints
         yield {"type": "status", "status": "dedup_loaded", "message": f"Loaded {len(c_hashes)} content hashes and {len(u_hashes)} URL hashes for deduplication."}
     except Exception as e:
         logging.error(f"Failed to preload hashes: {e}")
@@ -164,9 +242,17 @@ def run_kyc_process(filters):
     # So we effectively "Fill Gaps".
 
 
-    # We need to modify analyze_kyc_results to accept previous_findings and use them for Summary/Graph only.
-    # We need to modify analyze_kyc_results to accept previous_findings and use them for Summary/Graph only.
-    analysis_generator = analyze_kyc_results(all_search_results, filters, priority_links, previous_findings=previous_findings, syndication_filter=syndication_filter, existing_url_hashes=existing_url_hashes)
+    analysis_generator = analyze_kyc_results(
+        all_search_results,
+        filters,
+        priority_links,
+        previous_findings=previous_findings,
+        syndication_filter=syndication_filter,
+        existing_url_hashes=existing_url_hashes,
+        existing_url_fingerprints=existing_url_fingerprints,
+        coverage=total_coverage,
+        session_usage=session_usage,
+    )
     
     collected_new_findings = []
     
@@ -207,7 +293,7 @@ def run_kyc_process(filters):
             usage = graph_data.get("usage_metadata")
             session_usage["input_tokens"] += usage.get("input_tokens", 0)
             session_usage["output_tokens"] += usage.get("output_tokens", 0)
-            cost = calculate_cost('gemini-1.5-flash', usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+            cost = calculate_cost(DEFAULT_GEMINI_MODEL, usage.get("input_tokens", 0), usage.get("output_tokens", 0))
             session_usage["cost"] += cost
             yield {"type": "usage_update", "data": session_usage}
 

@@ -25,13 +25,17 @@ os.environ["GRPC_VERBOSITY"] = "ERROR"
 
 import logging
 import json
+import threading
+import time
 import concurrent.futures
 from flask import Flask, jsonify, request, send_from_directory, abort, Response, stream_with_context
 import uuid
+from .search.screening import RECOMMENDATION_INCOMPLETE, RECOMMENDATION_NO_ADVERSE_MEDIA
 # Import Spanner Client
 from .database.spanner_client import spanner_client
 from .database.schema_manager import apply_schema
 from .storage.gcs_client import gcs_client
+from .identity import derive_subject_id, extract_identity_attributes
 
 # --- Project Imports ---
 from .search.utils import (
@@ -50,8 +54,155 @@ from .search.utils import (
 )
 from .config import Config
 
+# --- Document upload validation ------------------------------------------
+# KYC evidence documents are uploaded by the subject or their agent, so the
+# filename, Content-Type and size are all untrusted. Only these types are
+# accepted, and the MIME type sent to Gemini is derived from the extension we
+# validated rather than from the client-declared header.
+ALLOWED_UPLOAD_EXTENSIONS = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "tif": "image/tiff",
+    "tiff": "image/tiff",
+}
+MAX_UPLOAD_BYTES = int(os.getenv("KYC_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+
 # Global executor for background tasks (e.g. summary regeneration)
 bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+
+# --- Summary regeneration debounce ---------------------------------------
+# Regeneration is triggered opportunistically from a GET handler, so without a
+# guard a single broken subject generates one Gemini call per page view, forever.
+# State is per-process; with multiple gunicorn workers the effective budget is
+# MAX_REGENERATION_ATTEMPTS per worker. Move this to Spanner (SummaryAttempts /
+# LastSummaryAttemptAt columns) if a hard global cap is required.
+MAX_REGENERATION_ATTEMPTS = int(os.environ.get("KYC_MAX_SUMMARY_ATTEMPTS", 3))
+REGENERATION_COOLDOWN_SECONDS = int(os.environ.get("KYC_SUMMARY_COOLDOWN_SECONDS", 300))
+
+_regeneration_lock = threading.Lock()
+_regeneration_state: dict = {}  # subject_id -> {"attempts": int, "last": float, "in_flight": bool}
+
+
+def _claim_regeneration_slot(subject_id: str) -> bool:
+    """Returns True if this caller may start a regeneration for `subject_id`."""
+    now = time.monotonic()
+    with _regeneration_lock:
+        state = _regeneration_state.setdefault(
+            subject_id, {"attempts": 0, "last": 0.0, "in_flight": False}
+        )
+        if state["in_flight"]:
+            return False
+        if state["attempts"] >= MAX_REGENERATION_ATTEMPTS:
+            return False
+        if now - state["last"] < REGENERATION_COOLDOWN_SECONDS:
+            return False
+        state["in_flight"] = True
+        state["attempts"] += 1
+        state["last"] = now
+        return True
+
+
+def _release_regeneration_slot(subject_id: str, succeeded: bool) -> None:
+    with _regeneration_lock:
+        state = _regeneration_state.get(subject_id)
+        if not state:
+            return
+        state["in_flight"] = False
+        if succeeded:
+            # Reset the budget so a later, genuinely new failure can still retry.
+            state["attempts"] = 0
+
+
+def _regenerate_and_release(subject_id: str):
+    """Runs regeneration and always releases the debounce slot."""
+    succeeded = False
+    try:
+        result = regenerate_kyc_summary(subject_id)
+        succeeded = bool(result)
+        return result
+    except Exception as e:
+        logging.error(f"Background summary regeneration failed for {subject_id}: {e}")
+        return None
+    finally:
+        _release_regeneration_slot(subject_id, succeeded)
+
+
+# --- Service-to-service authentication -------------------------------------
+# /api/worker/push and /api/tasks/pkyc-sweep are invoked by Pub/Sub and Cloud
+# Scheduler respectively. Both were previously unauthenticated: any caller able to
+# reach the service could enqueue screening work, consume the search quota, or
+# write findings against an arbitrary subject id.
+#
+# Cloud Run's built-in IAM check is the primary control; this is defence in depth
+# for deployments that must accept unauthenticated ingress.
+ALLOWED_OIDC_SERVICE_ACCOUNTS = {
+    sa.strip()
+    for sa in os.environ.get("KYC_ALLOWED_INVOKER_SAS", "").split(",")
+    if sa.strip()
+}
+OIDC_AUDIENCE = os.environ.get("KYC_OIDC_AUDIENCE", "")
+# Only honoured when K_SERVICE is absent, i.e. never on Cloud Run.
+ALLOW_UNAUTHENTICATED_TASKS = (
+    os.environ.get("KYC_ALLOW_UNAUTHENTICATED_TASKS", "false").lower() == "true"
+)
+
+
+def _verify_oidc_caller(req) -> tuple:
+    """
+    Verifies the Google-issued OIDC bearer token on a service-to-service request.
+
+    Returns (authorized, reason).
+    """
+    if ALLOW_UNAUTHENTICATED_TASKS:
+        if os.environ.get("K_SERVICE"):
+            # Fail closed: the escape hatch is for local development only and must
+            # never silently disable authentication on a deployed revision.
+            logging.error(
+                "KYC_ALLOW_UNAUTHENTICATED_TASKS is set on a Cloud Run revision. "
+                "Ignoring it and enforcing OIDC verification."
+            )
+        else:
+            return True, "unauthenticated tasks permitted (local development)"
+
+    auth_header = req.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return False, "missing bearer token"
+
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return False, "empty bearer token"
+
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token
+
+        claims = id_token.verify_oauth2_token(
+            token,
+            google_requests.Request(),
+            audience=OIDC_AUDIENCE or None,
+        )
+    except Exception as e:
+        return False, f"token verification failed: {e}"
+
+    if not claims.get("email_verified"):
+        return False, "token email is not verified"
+
+    email = claims.get("email", "")
+    if ALLOWED_OIDC_SERVICE_ACCOUNTS and email not in ALLOWED_OIDC_SERVICE_ACCOUNTS:
+        return False, f"service account {email} is not in the allow-list"
+
+    if not ALLOWED_OIDC_SERVICE_ACCOUNTS:
+        logging.warning(
+            "KYC_ALLOWED_INVOKER_SAS is unset; accepting any verified Google identity "
+            "for task endpoints. Set it to the Pub/Sub and Cloud Scheduler service "
+            "accounts to restrict access."
+        )
+
+    return True, f"verified {email}"
+
 
 from .search.business_logic import get_risk_category_options
 from .search.prompts import (
@@ -59,6 +210,7 @@ from .search.prompts import (
 )
 from .search.content_processing import analyze_document_authenticity
 import tempfile
+from werkzeug.utils import secure_filename
 
 # --- Worker & Pub/Sub Imports ---
 import base64
@@ -66,16 +218,9 @@ from .worker import process_subject
 from .events.publisher import publish_kyc_job
 
 
-# --- Hard-coded Priority Query Templates ---
-# These are based on the user's provided curl requests
-PRIORITY_QUERY_TEMPLATES = [
-    '"{subject_name}" AND (launder* OR terror* OR fraud OR corrupt* OR brib* OR traffick* OR "tax evasion" OR arrest* OR embezzle* OR illegal OR "insider deal" OR sanctions OR "sanctions evasion")',
-    '"{subject_name}" AND (crime OR investigat* OR alleg* OR convict* OR sentenced OR lawsuit OR litigation OR misdemeanor* OR offen* OR prosecut* OR scam* OR "tax amnesty")',
-    '"{subject_name}" AND (DPRK OR "Democratic People’s Republic of Korea" OR "North Korea" OR Iran OR Cuba OR Syria OR Crimea OR Donetsk OR Luhansk OR Kherson OR Zaporizhzhia OR Russia OR Venezuela OR Burma OR Myanmar OR Belarus)'
-]
-
-
-from .search.core import run_kyc_process
+# Single source of truth; core.py imports the same list.
+from .search.core import PRIORITY_QUERY_TEMPLATES, run_kyc_process
+from .scheduler import MAX_SUBJECTS_PER_RUN, init_scheduler, run_daily_kyc_job
 
 def _register_api_routes(app: Flask):
     """Registers all API routes for the Flask application."""
@@ -108,11 +253,15 @@ def _register_api_routes(app: Flask):
         incremental_param = request.args.get('incremental', 'false').lower()
         is_incremental = incremental_param == 'true'
 
+        customer_id = request.args.get('customerId', '').strip()
+        national_id = request.args.get('nationalId', '').strip()
+
         filters = {
             "subject_name": subject_name,
+            "customer_id": customer_id,
+            "national_id": national_id,
             "profession": profession,
             "company": company,
-            "region": region,
             "region": region,
             "dob": dob,
             "age": age,
@@ -127,9 +276,16 @@ def _register_api_routes(app: Flask):
         }
 
         # --- Persistence: Generate Subject ID and Save ---
-        subject_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, subject_name))
+        # Keyed on the institution's customer identifier where available; see
+        # backend/identity.py for why a name is not an acceptable primary key.
+        subject_id, key_strategy = derive_subject_id(
+            subject_name,
+            customer_id=customer_id,
+            attributes=extract_identity_attributes(filters),
+        )
         filters['subject_id'] = subject_id
-        
+        filters['key_strategy'] = key_strategy
+
         # Save Subject to Spanner (Non-blocking or fast enough)
         try:
              spanner_client.save_subject(subject_id, subject_name, filters)
@@ -137,6 +293,10 @@ def _register_api_routes(app: Flask):
              logging.warning(f"Failed to persist subject: {e}")
 
         def generate_events():
+            # Tracks whether the run ended in a defensible state. The client must
+            # be told explicitly: a silently-closed stream is indistinguishable
+            # from a crashed one, and "the spinner stopped" is not a verdict.
+            outcome = {"status": "complete", "message": "Screening complete.", "screening_incomplete": False}
             try:
                 # Use shared core logic
                 process_generator = run_kyc_process(filters)
@@ -145,6 +305,9 @@ def _register_api_routes(app: Flask):
                     # Map core events to frontend SSE format
                     event_type = event.get("type")
                     if event_type == "status":
+                        if event.get("status") == "screening_incomplete":
+                            outcome["screening_incomplete"] = True
+                            outcome["message"] = event.get("message") or "Screening could not be completed."
                         yield f'data: {json.dumps({"status": event.get("status"), "message": event.get("message"), "data": event.get("data")})}\n\n'
                     
                     elif event_type == "usage_update":
@@ -162,34 +325,74 @@ def _register_api_routes(app: Flask):
             except Exception as e:
                 logging.error(f"An error occurred during KYC check stream: {e}", exc_info=True)
                 yield f'data: {json.dumps({"status": "error", "message": "An unexpected error occurred. Please check the logs."})}\n\n'
+                return
+            # Terminal event. Always sent on a non-error path so the client can
+            # distinguish "finished" from "connection dropped mid-screening".
+            yield f'data: {json.dumps(outcome)}\n\n'
 
         return Response(stream_with_context(generate_events()), mimetype='text/event-stream')
 
+    def _resolve_finding_content(res):
+        """
+        Returns the article text for a finding, cheapest source first.
+
+        Order matters for correctness, not just cost. The text we assessed is the
+        text the export must show: re-scraping the live web can return an amended
+        or paywalled page, so the exported evidence would no longer match the
+        recorded verdict. The live scrape is a last resort, not the default.
+        """
+        # 1. Already in hand (fresh from this run's analysis).
+        for key in ("full_content", "full_content_text", "news content"):
+            content = res.get(key)
+            if content and len(content.strip()) > 200:
+                return content
+
+        # 2. Archived copy of exactly what was assessed.
+        gcs_uri = res.get("gcs_content_uri")
+        if gcs_uri:
+            cached = gcs_client.download_from_uri(gcs_uri)
+            if cached and cached.strip():
+                return cached
+            app.logger.warning(f"GCS cache miss for {gcs_uri}; falling back to scrape.")
+
+        # 3. Last resort: hit the live web.
+        url = res.get("url")
+        if not url:
+            return "No URL provided."
+        return scrape_url_content(url)
+
     def _scrape_and_prepare_all_findings(findings, subject_name):
         """
-        Helper to scrape all findings and transform them into the export-ready JSON format.
+        Helper to resolve full article text for all findings and transform them
+        into the export-ready JSON format.
         Returns a list of finding dictionaries (with full 'news content').
         """
-        # 1. Scrape Content (Parallel)
-        scraped_content_map = {}
-        app.logger.info(f"Scraping {len(findings)} URLs for full analysis...")
+        # 1. Resolve content (parallel; most will resolve without any network call)
+        content_by_index = {}
+        app.logger.info(f"Resolving content for {len(findings)} findings...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            future_to_url = {executor.submit(scrape_url_content, res.get('url')): res for res in findings if res.get('url')}
-            for future in concurrent.futures.as_completed(future_to_url):
-                res = future_to_url[future]
+            future_to_index = {
+                executor.submit(_resolve_finding_content, res): idx
+                for idx, res in enumerate(findings)
+            }
+            for future in concurrent.futures.as_completed(future_to_index):
+                idx = future_to_index[future]
                 try:
-                    scraped_content = future.result()
-                    scraped_content_map[res.get('url')] = scraped_content
+                    content_by_index[idx] = future.result()
                 except Exception as exc:
-                    app.logger.error(f'Scraping generated an exception for {res.get("url")}: {exc}')
-                    scraped_content_map[res.get('url')] = "Scraping failed."
+                    app.logger.error(
+                        f'Content resolution failed for {findings[idx].get("url")}: {exc}'
+                    )
+                    content_by_index[idx] = "Content unavailable."
 
         # 2. Transform Results
         processed_results = []
-        for res in findings:
-            url = res.get('url')
-            scraped_content = scraped_content_map.get(url, "No URL provided.")
-            transformed_res = transform_result_for_export(res, subject_name, scraped_content)
+        for idx, res in enumerate(findings):
+            # Index the map rather than the URL: two findings can legitimately
+            # share a URL (e.g. a revision), and a URL-keyed map would silently
+            # collapse them onto one body of text.
+            resolved = content_by_index.get(idx, "Content unavailable.")
+            transformed_res = transform_result_for_export(res, subject_name, resolved)
             processed_results.append(transformed_res)
             
         return processed_results
@@ -253,6 +456,11 @@ def _register_api_routes(app: Flask):
     def upload_document():
         """
         Handles document upload, validates authenticity with Gemini, and augments subject profile.
+
+        KYC documents are attacker-influenced input: the uploader is the subject
+        (or their agent), so the filename, declared MIME type and size are all
+        untrusted. We validate the extension against an allow-list, cap the
+        size, and never interpolate the client-supplied filename into a path.
         """
         if 'file' not in request.files:
             return jsonify({"error": "No file part"}), 400
@@ -261,25 +469,47 @@ def _register_api_routes(app: Flask):
         subject_id = request.form.get('subjectId')
         subject_name = request.form.get('subjectName')
         
-        if file.filename == '':
+        if not file.filename:
             return jsonify({"error": "No selected file"}), 400
             
         if not subject_id or not subject_name:
              return jsonify({"error": "Subject context missing"}), 400
 
+        # --- Validate extension against the allow-list -----------------------
+        safe_name = secure_filename(file.filename)
+        extension = os.path.splitext(safe_name)[1].lower().lstrip('.')
+        if extension not in ALLOWED_UPLOAD_EXTENSIONS:
+            return jsonify({
+                "error": (
+                    f"Unsupported file type '.{extension or 'unknown'}'. "
+                    f"Allowed: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}."
+                )
+            }), 400
+
+        # --- Enforce the size cap before writing anything to disk ------------
+        file.stream.seek(0, os.SEEK_END)
+        size_bytes = file.stream.tell()
+        file.stream.seek(0)
+        if size_bytes == 0:
+            return jsonify({"error": "Uploaded file is empty."}), 400
+        if size_bytes > MAX_UPLOAD_BYTES:
+            return jsonify({
+                "error": f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit."
+            }), 413
+
+        # Derive the MIME type from the validated extension rather than
+        # trusting the client-declared Content-Type header.
+        mime_type = ALLOWED_UPLOAD_EXTENSIONS[extension]
+
+        temp_path = None
         try:
-            # Save to temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as temp:
-                file.save(temp.name)
+            # Suffix comes from our own allow-list, never from user input.
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as temp:
                 temp_path = temp.name
-            
-            # Analyze
-            mime_type = file.content_type or "application/pdf"
+            file.save(temp_path)
+
             analysis_result = analyze_document_authenticity(temp_path, mime_type)
-            
-            # Cleanup temp
-            os.unlink(temp_path)
-            
+
             if "error" in analysis_result:
                 return jsonify(analysis_result), 500
                 
@@ -326,8 +556,17 @@ def _register_api_routes(app: Flask):
             return jsonify(analysis_result)
 
         except Exception as e:
-            logging.error(f"Upload failed: {e}")
-            return jsonify({"error": str(e)}), 500
+            logging.error(f"Upload failed: {e}", exc_info=True)
+            return jsonify({"error": "Document analysis failed. Please check the logs."}), 500
+        finally:
+            # Always remove the temp file, including when analysis raised.
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError as cleanup_error:
+                    logging.warning(
+                        f"Could not remove temp upload {temp_path}: {cleanup_error}"
+                    )
 
     @app.route('/api/search/submit', methods=['POST'])
     def submit_search():
@@ -363,12 +602,20 @@ def _register_api_routes(app: Flask):
             name = subj.get('name')
             if not name: continue
             
-            # Generate deterministic ID
-            s_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
+            # Deterministic ID, keyed on customer identifier where supplied.
+            s_id, key_strategy = derive_subject_id(
+                name,
+                customer_id=subj.get('customer_id') or subj.get('customerId'),
+                attributes=extract_identity_attributes(subj),
+            )
+            subj['subject_id'] = s_id
+            subj['key_strategy'] = key_strategy
 
-            # Check DB if mode is default
+            # Check DB if mode is default.
+            # Look up by the derived id first: get_subject_by_name would match a
+            # different customer who happens to share this name.
             if mode == 'default':
-                existing = spanner_client.get_subject_by_name(name)
+                existing = spanner_client.get_subject(s_id)
                 if existing:
                     results["skipped_existing"].append({
                         "name": name,
@@ -393,12 +640,48 @@ def _register_api_routes(app: Flask):
 
         return jsonify(results)
 
+    @app.route('/api/tasks/pkyc-sweep', methods=['POST'])
+    def pkyc_sweep():
+        """
+        Ongoing-monitoring sweep, invoked by Cloud Scheduler.
+
+        Replaces the in-process APScheduler job, which never enumerated any subjects
+        and ran once per gunicorn worker. See backend/scheduler.py.
+        """
+        authorized, reason = _verify_oidc_caller(request)
+        if not authorized:
+            logging.warning(f"Rejected pKYC sweep request: {reason}")
+            return jsonify({"error": "Unauthorized", "detail": reason}), 401
+
+        try:
+            limit = int(request.args.get('limit', MAX_SUBJECTS_PER_RUN))
+        except (TypeError, ValueError):
+            limit = MAX_SUBJECTS_PER_RUN
+
+        try:
+            result = run_daily_kyc_job(limit=limit)
+            # A partial dispatch failure is a monitoring gap. Return 500 so Cloud
+            # Scheduler records the failure and retries rather than reporting success.
+            status = 200 if result.get("failed", 0) == 0 else 500
+            return jsonify(result), status
+        except Exception as e:
+            logging.error(f"pKYC sweep failed: {e}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+
     @app.route('/api/worker/push', methods=['POST'])
     def worker_push():
         """
         Endpoint for Pub/Sub Push subscriptions.
         Receives a message, parses the payload, and executes the worker logic.
         """
+        # The push endpoint previously executed whatever it was sent, with no
+        # authentication at all. Anyone who could reach the service could enqueue
+        # arbitrary screening work and burn the search quota.
+        authorized, reason = _verify_oidc_caller(request)
+        if not authorized:
+            logging.warning(f"Rejected worker push: {reason}")
+            return jsonify({"error": "Unauthorized", "detail": reason}), 401
+
         envelope = request.get_json()
         if not envelope:
             return 'Bad Request: no message received', 400
@@ -480,7 +763,16 @@ def _register_api_routes(app: Flask):
 
             # --- Persistence: Save Graph ---
             try:
-                subj_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, subject_name))
+                # Prefer the id the caller is already working with; deriving it from
+                # the name again would attach the graph to a different subject
+                # whenever the name is shared or was keyed on a customer id.
+                subj_id = (data.get('subject_id') or '').strip()
+                if not subj_id:
+                    subj_id, _ = derive_subject_id(
+                        subject_name,
+                        customer_id=data.get('customer_id') or data.get('customerId'),
+                        attributes=extract_identity_attributes(data),
+                    )
                 if graph_data.get("nodes"):
                     spanner_client.save_graph_data(subj_id, graph_data["nodes"], graph_data["edges"])
             except Exception as e:
@@ -534,23 +826,50 @@ def _register_api_routes(app: Flask):
             if not subject:
                 return jsonify({"error": "Subject not found"}), 404
             
-            # Auto-Recovery: Check if summary is missing or failed, and retrigger
+            # Auto-Recovery: retrigger summary generation only when it is genuinely
+            # missing or broken, and only within a bounded retry budget.
+            #
+            # The previous version resubmitted on EVERY GET whose risk_score was
+            # "Unknown". Since a failed generation also writes "Unknown", each page
+            # view launched another Gemini call that failed and rewrote "Unknown" -
+            # an unbounded, billable loop. It also cannot distinguish that failure
+            # from a legitimate fail-closed verdict, which must NOT be retried away.
             summary_str = subject.get('summary')
             should_regenerate = False
-            
+            regenerate_reason = None
+
             if not summary_str:
                 should_regenerate = True
+                regenerate_reason = "no summary persisted"
             else:
                 try:
                     s_data = json.loads(summary_str)
-                    if s_data.get('risk_score') == 'Unknown' or "Error" in s_data.get('summary', ''):
+                    recommendation = s_data.get('recommendation', '')
+                    is_deliberate_incomplete = recommendation == RECOMMENDATION_INCOMPLETE
+
+                    if is_deliberate_incomplete:
+                        # A fail-closed verdict is a correct result, not a broken one.
+                        # Regenerating cannot fix it; only a re-screen can.
+                        should_regenerate = False
+                    elif s_data.get('risk_score') == 'Unknown' or "Error" in s_data.get('summary', ''):
                         should_regenerate = True
-                except:
+                        regenerate_reason = "summary records a generation error"
+                except (json.JSONDecodeError, TypeError, AttributeError):
                     should_regenerate = True
-            
+                    regenerate_reason = "summary is not valid JSON"
+
+            if should_regenerate and not _claim_regeneration_slot(subject_id):
+                logging.info(
+                    f"Suppressing summary regeneration for {subject_id}: "
+                    "retry budget exhausted or attempt already in flight."
+                )
+                should_regenerate = False
+
             if should_regenerate:
-                logging.info(f"Summary for {subject_id} is missing/invalid. Retriggering regeneration in background.")
-                bg_executor.submit(regenerate_kyc_summary, subject_id)
+                logging.info(
+                    f"Regenerating summary for {subject_id} in background ({regenerate_reason})."
+                )
+                bg_executor.submit(_regenerate_and_release, subject_id)
 
             findings = spanner_client.get_findings(subject_id)
             graph_data = spanner_client.get_graph_data(subject_id)
@@ -610,12 +929,11 @@ def create_app():
 
 app = create_app()
 
-# Initialize Scheduler
-try:
-    from .scheduler import init_scheduler
-    init_scheduler(app)
-except Exception as e:
-    logging.warning(f"Could not start scheduler: {e}")
+# Ongoing monitoring is NOT started here. Module-level init under `gunicorn -w 4`
+# created four independent schedulers, each firing the same job. pKYC is now driven
+# by Cloud Scheduler against POST /api/tasks/pkyc-sweep; see backend/scheduler.py
+# for the provisioning command.
+init_scheduler(app)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))

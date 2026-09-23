@@ -92,27 +92,51 @@ echo "Deploying image $MAIN_IMAGE_NAME to Cloud Run service $CLOUDRUN_SERVICE_NA
 # Prepare environment variables string for Cloud Run
 # Non-sensitive variables sourced from init.sh or derived
 ENV_VARS="APP_MODE=$APP_MODE_VAR"
+ENV_VARS+=",GOOGLE_CLOUD_PROJECT=$PROJECT_ID"
+ENV_VARS+=",GEMINI_MODEL=gemini-3.8-flash"
+ENV_VARS+=",GOOGLE_GENAI_USE_VERTEXAI=TRUE"
 ENV_VARS+=",SPANNER_INSTANCE=$SPANNER_INSTANCE"
 ENV_VARS+=",SPANNER_DATABASE=$SPANNER_DATABASE"
 ENV_VARS+=",GCS_BUCKET_NAME=$GCS_BUCKET_NAME"
 ENV_VARS+=",GOOGLE_CLOUD_DISABLE_OPENTELEMETRY=true"
-ENV_VARS+=",SB_API_KEY="
+
+# --- Screening governance -------------------------------------------------
+# Tenant scope for subject-id derivation. Two institutions sharing a deployment
+# must not share a subject namespace.
+ENV_VARS+=",KYC_TENANT_ID=${KYC_TENANT_ID:-default}"
+# Diligence-tier query budgets. These cap Custom Search spend per subject and
+# are enforced in code, not just requested in the prompt.
+ENV_VARS+=",KYC_QUERIES_STANDARD=${KYC_QUERIES_STANDARD:-25}"
+ENV_VARS+=",KYC_QUERIES_ENHANCED=${KYC_QUERIES_ENHANCED:-100}"
+ENV_VARS+=",KYC_QUERIES_MONITORING=${KYC_QUERIES_MONITORING:-10}"
+# Custom Search quota guardrails.
+ENV_VARS+=",KYC_SEARCH_DAILY_LIMIT=${KYC_SEARCH_DAILY_LIMIT:-10000}"
+ENV_VARS+=",KYC_SEARCH_MAX_QPS=${KYC_SEARCH_MAX_QPS:-8}"
+# pKYC monitoring cadence (days) and per-sweep cap.
+ENV_VARS+=",KYC_MONITOR_DAYS_HIGH=${KYC_MONITOR_DAYS_HIGH:-1}"
+ENV_VARS+=",KYC_MONITOR_DAYS_MEDIUM=${KYC_MONITOR_DAYS_MEDIUM:-7}"
+ENV_VARS+=",KYC_MONITOR_DAYS_LOW=${KYC_MONITOR_DAYS_LOW:-30}"
+ENV_VARS+=",KYC_MONITOR_MAX_SUBJECTS=${KYC_MONITOR_MAX_SUBJECTS:-200}"
+# Upload hardening.
+ENV_VARS+=",KYC_MAX_UPLOAD_BYTES=${KYC_MAX_UPLOAD_BYTES:-20971520}"
+# Service accounts permitted to call /api/worker/push and /api/tasks/pkyc-sweep.
+# Empty means "reject everything", which is the correct default: an unauthenticated
+# task endpoint lets anyone enqueue screening work or replay results.
+ENV_VARS+=",KYC_ALLOWED_INVOKER_SAS=${KYC_ALLOWED_INVOKER_SAS:-}"
 
 
 # Sensitive variables (secrets) loaded from Secret Manager
-# Assume secrets are named DB_PASSWORD, GOOGLE_API_KEY, GOOGLE_CSE_ID
 gcloud run deploy "$CLOUDRUN_SERVICE_NAME" \
     --image "$MAIN_IMAGE_NAME" \
     --region "$GCP_REGION" \
     --platform managed \
     --port 8080 `# Port your container listens on (defined in entrypoint)`\
     --set-env-vars "$ENV_VARS" \
-    --set-secrets=GOOGLE_API_KEY=GOOGLE_API_KEY:latest,\
-GOOGLE_CSE_ID=GOOGLE_CSE_ID:latest \
+    --set-secrets="GOOGLE_API_KEY=GOOGLE_API_KEY:latest,GOOGLE_SEARCH_API_KEY=GOOGLE_SEARCH_API_KEY:latest,GOOGLE_CSE_ID=GOOGLE_CSE_ID:latest,SB_API_KEY=SB_API_KEY:latest" \
     --min-instances 1 \
     --max-instances 1 \
     --no-allow-unauthenticated `# Configured IAM` \
-    --timeout=927s `# Set timeout to 927 seconds` \
+    --timeout=927s `# Set timeout to 927 seconds`
     # --add-cloudsql-instances "$CLOUD_SQL_INSTANCE_CONNECTION_NAME" \
     
 

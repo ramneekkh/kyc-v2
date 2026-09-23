@@ -20,8 +20,11 @@ from google.genai.types import GenerateContentConfig
 from .prompts import AGENT_PROMPT
 from .utils import agent_find_leads, generic_search # Import both tools
 
+# Ensure Google ADK uses Vertex AI with Application Default Credentials (ADC)
+os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
+
 # Define the model for the agent
-MODEL = 'gemini-3-flash-preview'
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 # --- Define the Root Agent ---
 # This agent orchestrates the conversational experience, using the

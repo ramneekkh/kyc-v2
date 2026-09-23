@@ -47,6 +47,6 @@ echo "Starting backend server with Gunicorn... (from project root)"
 PORT="${PORT:-8080}"
 
 echo "Attempting to start Gunicorn on port $PORT..."
-# Run gunicorn from the project root, pointing to the 'app' object in the 'backend.app' module
-exec gunicorn -w 4 -b 0.0.0.0:$PORT --timeout 1200 --preload backend.app:app --log-level warn --access-logfile - --error-logfile -
+# Run gunicorn from the project root, pointing to the 'app' object in the 'backend.app' module (no --preload for gRPC fork safety)
+exec gunicorn -w 4 -b 0.0.0.0:$PORT --timeout 1200 backend.app:app --log-level info --access-logfile - --error-logfile -
 # Using '-' for logfiles sends them to stdout/stderr, which is common for containerized apps.

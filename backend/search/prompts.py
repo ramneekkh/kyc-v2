@@ -52,7 +52,7 @@ You are a world-class financial crimes investigator specializing in open-source 
 {risk_categories}
 
 **--- YOUR TASK ---**
-**Goal:** Generate a massive, exhaustive list of at least **100** highly effective search queries. You must go beyond the obvious. Combine the subject's name with their profile details, risk keywords, AND localized/colloquial terms to find hidden risks.
+**Goal:** Generate an exhaustive list of exactly **{num_queries}** highly effective search queries, ordered most-informative first. You must go beyond the obvious. Combine the subject's name with their profile details, risk keywords, AND localized/colloquial terms to find hidden risks.
 
 **Step-by-Step Instructions:**
 
@@ -88,7 +88,10 @@ You are a world-class financial crimes investigator specializing in open-source 
     *   Use filetype operators: `"{subject_name}" filetype:pdf (court OR judgment)`
 
 **7.  Final Output:**
-    *   Return ONLY a valid JSON list of at least **100** strings.
+    *   Return ONLY a valid JSON list of **{num_queries}** strings, ordered so the
+        highest-yield queries come first. The caller enforces a per-tier query
+        budget and will truncate the tail, so anything you rank low may never
+        be executed -- do not bury the decisive query at position 90.
     *   No markdown formatting, just the raw JSON array.
 """
 
@@ -115,11 +118,23 @@ You are a compliance analyst AI. Your task is to analyze a single Google search 
 * **Snippet:** "{snippet}"
 * **Link:** "{link}"
 
+**--- Full Article Text ---**
+The text below was retrieved from the link above. It may be empty or truncated if
+retrieval failed; in that case fall back to the title and snippet and lower your
+identity confidence accordingly.
+
+[BEGIN ARTICLE]
+{full_article_text}
+[END ARTICLE]
+
 **Instructions:**
-1.  **Assess Relevance & Categorize:** Read the title and snippet. Determine if the article relates to the subject and any potential risks.
-2.  **Verify Identity (Crucial):**
-    *   Check if the **Age** aligns. If the subject is {age} today, calculate their likely age at the time of the event.Mismatched ages (e.g., 20yo vs 60yo) indicate a False Positive.
+1.  **Assess Relevance & Categorize:** Read the **Full Article Text** first; the title and snippet are only a fallback. Determine if the article relates to the subject and any potential risks.
+2.  **Verify Identity (Crucial):** Identity resolution MUST be driven by the full article text, because corroborating identifiers (date of birth, employer, job title, nationality, co-defendants, spouse) almost never appear in the snippet.
+    *   Check if the **Age** aligns. If the subject is {age} today, calculate their likely age at the time of the event. Mismatched ages (e.g., 20yo vs 60yo) indicate a False Positive.
     *   Check Name Variations (e.g. Md. vs Mohammed).
+    *   Search the body text for the Company, Spouse, Alias, Region and DOB given in the Subject Profile. A single corroborated identifier is worth more than a hundred name-only mentions.
+    *   **Do NOT infer a match from name alone when the name is common.** If the body text gives you nothing to confirm or exclude the subject, set `match_status` to `HITL`.
+2a. **Article Retrieval Failure:** If the Full Article Text is empty, says "Scraping failed", or is clearly a paywall/consent interstitial rather than article content, you MUST cap Subject Identity Confidence at 2 and set `content_available` to false. Never award a Definitive Match on a snippet alone.
 3.  **Write a Concise Insight:** brief summary of the risk/content.
 4.  **Determine Risk Level:** `['High', 'Medium', 'Low', 'None']`.
 5.  **Assign a Fine-Grained Relevance Score (1-10):**
@@ -142,8 +157,10 @@ You are a compliance analyst AI. Your task is to analyze a single Google search 
         *   `0`: Official News, Government, Corporate Website, Legal DB.
         *   `-1`: Blogs, Forums, Aggregators.
         *   `-3`: Social Media (Twitter/X, Facebook, LinkedIn, Reddit, TikTok, etc.) or User-Generated Content sites.
+        *   **CAP:** If Risk Severity (B) is >= 3, the penalty is capped at `-1` regardless of source type. A credible-looking allegation of serious financial crime is a lead to be verified, not noise to be discarded. Low-quality sourcing is captured in `media_house_reputation`, which the analyst sees separately.
     *   **Final Score:** Sum (A + B + C + D). Min 0, Max 10.
     *   **OVERRIDE:** If Risk Level is 'High' AND Identity Confidence is >= 3, Score MUST be >= 8 (even with penalties, high risk confirmed identity is relevant).
+    *   **The score is a triage aid, never a suppression mechanism.** Report severity and identity confidence honestly in their own fields; do not deflate them to make the total look tidy.
 
     *   **E. Match Status:**
         *   `Confirmed`: Definitive match based on unique identifiers.
@@ -163,6 +180,8 @@ You are a compliance analyst AI. Your task is to analyze a single Google search 
 
 **Output Schema:**
 Return a single valid JSON object. Do not add any other text.
+`relevance_score`, `identity_confidence` and `risk_severity` MUST be plain integers.
+Never emit "N/A", null, or a string for these three fields - emit `0` if unknown.
 
 **JSON Schema:**
 {{
@@ -172,6 +191,10 @@ Return a single valid JSON object. Do not add any other text.
   "match_status": "Confirmed/Likely/Possible/Negative/HITL",
   "media_house_reputation": "Tier 1 News/Regional News/Industry Trade/Blog/Opinion/Social Media/Unknown",
   "relevance_score": Integer (0-10),
+  "identity_confidence": Integer (0-4, component A above),
+  "risk_severity": Integer (0-4, component B above),
+  "content_available": true or false (was the full article text usable?),
+  "identity_evidence": "The exact phrase(s) from the article that confirm or exclude the subject, or 'None found'.",
   "publication_date": "YYYY-MM-DD" or "N/A"
 }}
 """
@@ -210,9 +233,24 @@ You must return **ONLY** a valid JSON object. Do not include markdown formatting
       "citations": ["List of EXACT URLs backing this finding. CANNOT BE EMPTY."]
     }}
   ],
-  "recommendation": "Accept", "Reject", or "Manual Review" (Choose ONE. Do NOT add reasoning here.),
+  "requires_human_review": [
+    {{
+      "reason": "Short label, e.g. 'Unresolved identity match' or 'Severe allegation, single low-quality source'.",
+      "detail": "What specifically a human must resolve.",
+      "citations": ["Relevant URLs."]
+    }}
+  ],
+  "recommendation": "No Adverse Media Found" | "Adverse Media - Requires Review" | "Adverse Media - Escalate" | "Screening Incomplete - Manual Review Required",
   "reasoning": "One sentence explaining the recommendation."
 }}
+
+# Recommendation Rules (STRICT)
+You are producing an input to a human compliance decision. You are NOT making the decision.
+*   You MUST NOT output "Accept", "Reject", "Approve", "Deny", or "Clear". Those are human acts with legal consequence and are not yours to make.
+*   `No Adverse Media Found` - only when the findings contain no credible adverse information about THIS subject.
+*   `Adverse Media - Requires Review` - adverse information exists but is unconfirmed, dated, low-severity, or of uncertain identity.
+*   `Adverse Media - Escalate` - confirmed identity plus serious allegations (financial crime, sanctions nexus, active investigation, conviction).
+*   Any finding with `match_status` of `HITL`, or a High severity claim you could not identity-confirm, MUST appear in `requires_human_review`. An empty `requires_human_review` asserts that nothing is ambiguous - only say that when it is true.
 
 # Instruction for Consistency
 If the input news contains NO new adverse information compared to a standard baseline, the summary must default to a neutral tone. Do not hallucinate risks.

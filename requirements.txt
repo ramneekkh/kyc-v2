@@ -1,9 +1,15 @@
 flask
-google-cloud-spanner
+google-genai
 google-generativeai
+google-api-python-client
+google-cloud-secret-manager
+google-cloud-spanner
+google-cloud-storage
+google-cloud-pubsub
 python-dotenv
 requests
 beautifulsoup4
-google-cloud-storage
-google-cloud-pubsub
 gunicorn
+
+# --- Development / CI only ---
+pytest

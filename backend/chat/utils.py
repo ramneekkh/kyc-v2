@@ -64,13 +64,15 @@ def agent_find_leads(keywords: List[str], region: str = 'ASEAN', signal_types: O
         "recency_days": 30,
     }
 
-    search_queries = generate_search_queries_with_gemini(filters, SEARCH_QUERY_BRAINSTORMING_PROMPT)
+    search_queries, _ = generate_search_queries_with_gemini(filters, SEARCH_QUERY_BRAINSTORMING_PROMPT)
     if not search_queries:
         logging.warning("Agent could not brainstorm any search queries for lead discovery.")
         return []
     
     logging.info(f"Agent brainstormed lead discovery queries: {search_queries}")
-    search_results = perform_google_web_searches(search_queries, filters['num_results'], filters['recency_days'])
+    search_results, coverage = perform_google_web_searches(search_queries, filters['num_results'], filters['recency_days'])
+    if not coverage.is_complete:
+        logging.warning(f"Lead discovery search had degraded coverage: {coverage.describe()}")
     logging.info(f"Agent found {len(search_results)} raw results for lead discovery.")
     return search_results
 
@@ -106,12 +108,14 @@ def generic_search(query: str) -> List[Dict]:
     }
 
     # We can reuse the same brainstorming prompt, but the inputs make it generic.
-    search_queries = generate_search_queries_with_gemini(filters, SEARCH_QUERY_BRAINSTORMING_PROMPT)
+    search_queries, _ = generate_search_queries_with_gemini(filters, SEARCH_QUERY_BRAINSTORMING_PROMPT)
     if not search_queries:
         logging.warning("Agent could not brainstorm any search queries for the generic request.")
         return []
 
     logging.info(f"Agent brainstormed generic queries: {search_queries}")
-    search_results = perform_google_web_searches(search_queries, filters['num_results'], filters['recency_days'])
+    search_results, coverage = perform_google_web_searches(search_queries, filters['num_results'], filters['recency_days'])
+    if not coverage.is_complete:
+        logging.warning(f"Generic search had degraded coverage: {coverage.describe()}")
     logging.info(f"Agent found {len(search_results)} raw results for the generic query.")
     return search_results

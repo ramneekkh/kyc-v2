@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Settings, ExternalLink, AlertTriangle, CheckCircle, Network, Download, ArrowUp, ArrowDown, Filter, Star, X, User } from 'lucide-react';
+import { Settings, ExternalLink, AlertTriangle, CheckCircle, Network, Download, ArrowUp, ArrowDown, Filter, Star, X, User, UserCheck, ShieldAlert, HelpCircle } from 'lucide-react';
 import GraphView from './GraphView';
 import ErrorBoundary from './ErrorBoundary';
 import ReactMarkdown from 'react-markdown';
@@ -362,6 +362,45 @@ const ResultsTable = ({ results, riskCategoryFilter, onFilterChange, appConfig, 
     );
 };
 
+// --- Screening outcome vocabulary -------------------------------------------
+// These MUST mirror backend/search/screening.py. The system deliberately never
+// says "Accept" or "Reject": an automated adverse-media search is one input to
+// a CDD decision, not the decision itself, and rendering it as one invites a
+// reviewer to rubber-stamp it.
+const RECOMMENDATION_NO_ADVERSE_MEDIA = 'No Adverse Media Found';
+const RECOMMENDATION_REQUIRES_REVIEW = 'Adverse Media - Requires Review';
+const RECOMMENDATION_ESCALATE = 'Adverse Media - Escalate';
+const RECOMMENDATION_INCOMPLETE = 'Screening Incomplete - Manual Review Required';
+
+const recommendationStyle = (recommendation) => {
+    switch (recommendation) {
+        case RECOMMENDATION_NO_ADVERSE_MEDIA:
+            return 'bg-emerald-900/30 text-emerald-300 border-emerald-800';
+        case RECOMMENDATION_ESCALATE:
+            return 'bg-red-900/30 text-red-300 border-red-800';
+        case RECOMMENDATION_INCOMPLETE:
+            // Grey, not green. An incomplete screen is an absence of evidence,
+            // and must never be styled like a clean result.
+            return 'bg-slate-800 text-slate-300 border-slate-600';
+        case RECOMMENDATION_REQUIRES_REVIEW:
+        default:
+            return 'bg-amber-900/30 text-amber-300 border-amber-800';
+    }
+};
+
+const RecommendationIcon = ({ recommendation }) => {
+    switch (recommendation) {
+        case RECOMMENDATION_NO_ADVERSE_MEDIA:
+            return <CheckCircle size={14} />;
+        case RECOMMENDATION_ESCALATE:
+            return <ShieldAlert size={14} />;
+        case RECOMMENDATION_INCOMPLETE:
+            return <HelpCircle size={14} />;
+        default:
+            return <AlertTriangle size={14} />;
+    }
+};
+
 const SummaryReport = ({ summary }) => {
     if (!summary) return null;
 
@@ -395,15 +434,62 @@ const SummaryReport = ({ summary }) => {
                         <RiskIndicator level={summary.risk_score} />
                     </div>
                     <div className="flex flex-col items-end">
-                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Action</span>
-                        <span className={`px-3 py-1 rounded-full text-xs font-bold border flex items-center gap-1 ${summary.recommendation === 'Accept' ? 'bg-emerald-900/30 text-emerald-300 border-emerald-800' : summary.recommendation === 'Reject' ? 'bg-red-900/30 text-red-300 border-red-800' : 'bg-amber-900/30 text-amber-300 border-amber-800'}`}>
-                            {summary.recommendation === 'Accept' && <CheckCircle size={14} />}
-                            {summary.recommendation === 'Reject' && <X size={14} />}
+                        {/* "Screening Outcome", not "Action". This tool reports what the
+                            adverse-media search found; the accept/reject decision belongs
+                            to a human in the bank's own workflow. */}
+                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Screening Outcome</span>
+                        <span className={`px-3 py-1 rounded-full text-xs font-bold border flex items-center gap-1 ${recommendationStyle(summary.recommendation)}`}>
+                            <RecommendationIcon recommendation={summary.recommendation} />
                             {summary.recommendation}
                         </span>
                     </div>
                 </div>
             </div>
+
+            {/* Screening coverage: a verdict is only as good as the search behind it. */}
+            {summary.screening_coverage && summary.screening_coverage.is_complete === false && (
+                <div className="bg-amber-950/40 border border-amber-800 rounded-xl p-4 flex gap-3 items-start">
+                    <AlertTriangle size={18} className="text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                        <h3 className="text-xs font-bold text-amber-300 uppercase tracking-wide mb-1">Incomplete Screening Coverage</h3>
+                        <p className="text-sm text-amber-100/80">
+                            {summary.screening_coverage.description ||
+                                `Only ${summary.screening_coverage.queries_succeeded ?? 0} of ${summary.screening_coverage.queries_attempted ?? 0} source queries completed.`}
+                            {' '}This assessment is not a complete picture and must not be relied on without manual review.
+                        </p>
+                    </div>
+                </div>
+            )}
+
+            {/* Items a machine must not dispose of on its own. */}
+            {summary.requires_human_review && summary.requires_human_review.length > 0 && (
+                <div className="overflow-hidden bg-slate-900 rounded-lg border border-amber-900/60 shadow-sm">
+                    <div className="bg-amber-950/40 px-4 py-2 border-b border-amber-900/60 flex items-center gap-2">
+                        <UserCheck size={13} className="text-amber-400" />
+                        <h3 className="font-bold text-xs text-amber-300 uppercase tracking-wide">
+                            Requires Human Review ({summary.requires_human_review.length})
+                        </h3>
+                    </div>
+                    <ul className="divide-y divide-slate-800">
+                        {summary.requires_human_review.map((item, i) => (
+                            <li key={i} className="px-4 py-3">
+                                <p className="text-sm font-semibold text-slate-200">{item.reason}</p>
+                                <p className="text-xs text-slate-400 mt-0.5">{item.detail}</p>
+                                {item.citations && item.citations.length > 0 && (
+                                    <div className="mt-1.5 flex gap-1 flex-wrap">
+                                        {item.citations.slice(0, 3).map((url, ci) => (
+                                            <a key={ci} href={url} target="_blank" rel="noopener noreferrer"
+                                                className="inline-flex items-center text-[10px] text-blue-400 hover:text-blue-300 bg-blue-900/20 px-1.5 py-0.5 rounded border border-blue-800">
+                                                Source {ci + 1} <ExternalLink size={8} className="ml-0.5" />
+                                            </a>
+                                        ))}
+                                    </div>
+                                )}
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+            )}
 
             <div className="bg-slate-950/50 p-5 rounded-xl border border-slate-800 text-slate-300 leading-relaxed text-sm shadow-inner">
                 <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-2 flex items-center gap-2"><User size={12} /> Profile Overview</h3>
@@ -468,6 +554,10 @@ function App() {
     const [summary, setSummary] = useState(null);
     const [isSearching, setIsSearching] = useState(false);
     const [costStats, setCostStats] = useState({ input_tokens: 0, output_tokens: 0, cost: 0 });
+    // Screening-coverage alert. Held in its own state (not just the process log)
+    // because a degraded or abandoned search must stay visible next to the
+    // verdict, not scroll away in a list of progress messages.
+    const [coverageAlert, setCoverageAlert] = useState(null);
     const [searchMode, setSearchMode] = useState('new');
     const [savedSubjects, setSavedSubjects] = useState([]);
     const [loadingSubjects, setLoadingSubjects] = useState(false);
@@ -507,6 +597,7 @@ function App() {
         setStatus('loading_record');
         setResults([]);
         setSummary(null);
+        setCoverageAlert(null);
         setProgress([]);
         setCandidates([]);
         setSelectedCandidate(null);
@@ -555,6 +646,7 @@ function App() {
         setProgress([]);
         setResults([]);
         setSummary(null);
+        setCoverageAlert(null);
         setCandidates([]);
         setPriorityQueries([]);
         setGeneratedQueries([]);
@@ -619,7 +711,28 @@ function App() {
                     case 'graph_data':
                         setLoadedGraphData(data.data);
                         break;
+                    // Search coverage was degraded but the run continued. Surfaced
+                    // as a persistent banner because it changes how much weight a
+                    // reviewer may place on a "no adverse media" outcome.
+                    case 'degraded_coverage':
+                        setCoverageAlert({ severity: 'warning', message: data.message });
+                        setProgress(prev => [...prev, data]);
+                        break;
+                    // The run was abandoned because too little of the intended
+                    // search surface was reachable. This is NOT a clean result.
+                    case 'screening_incomplete':
+                        setCoverageAlert({ severity: 'critical', message: data.message });
+                        setProgress(prev => [...prev, data]);
+                        break;
                     case 'complete':
+                        if (data.screening_incomplete) {
+                            setCoverageAlert({ severity: 'critical', message: data.message });
+                        }
+                        setIsSearching(false);
+                        es.close();
+                        eventSourceRef.current = null;
+                        setProgress(prev => [...prev, data]);
+                        break;
                     case 'error':
                         setIsSearching(false);
                         es.close();
@@ -894,6 +1007,32 @@ function App() {
                         />
                         {/* Results Section directly below search */}
                         <div className="mt-8">
+                            {/* Coverage banner sits ABOVE the summary: a reviewer must
+                                see that the search was degraded before they read any
+                                conclusion drawn from it. */}
+                            {coverageAlert && (
+                                <div className={`mb-6 rounded-xl p-4 flex gap-3 items-start border ${coverageAlert.severity === 'critical'
+                                    ? 'bg-red-950/40 border-red-800'
+                                    : 'bg-amber-950/40 border-amber-800'}`}>
+                                    <AlertTriangle
+                                        size={18}
+                                        className={`shrink-0 mt-0.5 ${coverageAlert.severity === 'critical' ? 'text-red-400' : 'text-amber-400'}`}
+                                    />
+                                    <div>
+                                        <h3 className={`text-xs font-bold uppercase tracking-wide mb-1 ${coverageAlert.severity === 'critical' ? 'text-red-300' : 'text-amber-300'}`}>
+                                            {coverageAlert.severity === 'critical'
+                                                ? 'Screening Incomplete'
+                                                : 'Degraded Search Coverage'}
+                                        </h3>
+                                        <p className={`text-sm ${coverageAlert.severity === 'critical' ? 'text-red-100/80' : 'text-amber-100/80'}`}>
+                                            {coverageAlert.message}
+                                            {coverageAlert.severity === 'critical' &&
+                                                ' No conclusion about this subject can be drawn from this run.'}
+                                        </p>
+                                    </div>
+                                </div>
+                            )}
+
                             {summary && (
                                 <div className="mb-8">
                                     <ErrorBoundary>

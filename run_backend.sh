@@ -1,9 +1,19 @@
 #!/bin/bash
 # run_backend.sh
 
-# Set environment variables if needed (or load from .env)
+# Load .env safely.
+#
+# `export $(cat .env | xargs)` is broken in three ways that matter here: it
+# word-splits on spaces (so any value containing one is truncated or turns into
+# a second bogus variable), it strips quoting, and it passes the contents
+# through shell expansion -- a `$` or backtick in a secret gets evaluated.
+# `set -a` + `.` makes the shell parse the file as assignments, which is what
+# was intended.
 if [ -f .env ]; then
-  export $(cat .env | xargs)
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
 fi
 
 export FLASK_APP=backend.app
