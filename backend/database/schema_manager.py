@@ -246,6 +246,150 @@ def apply_schema():
             else:
                 logger.warning(f"Migration failed for {stmt}: {e}")
 
+    # 2b. Governance & Sanctions Watchlist Tables (WatchlistHits, FindingDispositions, CaseReviews, AuditEvents)
+    logger.info("Ensuring sanctions watchlist and four-eyes governance tables exist...")
+    if is_pg:
+        governance_tables = [
+            """CREATE TABLE IF NOT EXISTS WatchlistHits (
+                HitId varchar(36) NOT NULL PRIMARY KEY,
+                SubjectId varchar(36) NOT NULL,
+                ListId varchar(64) NOT NULL,
+                ListName text,
+                Authority text,
+                EntityId varchar(128),
+                SchemaType varchar(64),
+                PrimaryName text,
+                MatchedName text,
+                QueriedName text,
+                QueriedRole varchar(64),
+                MatchScore double precision,
+                MatchStrength varchar(32),
+                DobCorroboration varchar(32),
+                CountryCorroboration varchar(32),
+                HitData jsonb,
+                CreatedAt timestamptz NOT NULL,
+                UpdatedAt timestamptz
+            )""",
+            """CREATE TABLE IF NOT EXISTS FindingDispositions (
+                DispositionId varchar(36) NOT NULL PRIMARY KEY,
+                SubjectId varchar(36) NOT NULL,
+                ItemId varchar(64) NOT NULL,
+                ItemType varchar(32) NOT NULL,
+                ItemTitle text,
+                Verdict varchar(64) NOT NULL,
+                Rationale text NOT NULL,
+                MakerEmail varchar(256) NOT NULL,
+                MakerAuthSource varchar(64),
+                CreatedAt timestamptz NOT NULL,
+                UpdatedAt timestamptz NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS CaseReviews (
+                SubjectId varchar(36) NOT NULL PRIMARY KEY,
+                ReviewState varchar(64) NOT NULL,
+                ProposedRiskRating varchar(32),
+                ProposedDecision varchar(64),
+                MakerEmail varchar(256),
+                MakerAuthSource varchar(64),
+                MakerRationale text,
+                MakerSubmittedAt timestamptz,
+                CheckerEmail varchar(256),
+                CheckerAuthSource varchar(64),
+                CheckerAction varchar(64),
+                CheckerRationale text,
+                CheckerDecidedAt timestamptz,
+                UpdatedAt timestamptz NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS AuditEvents (
+                EventId varchar(36) NOT NULL PRIMARY KEY,
+                SubjectId varchar(36) NOT NULL,
+                EventType varchar(64) NOT NULL,
+                ActorEmail varchar(256) NOT NULL,
+                ActorAuthSource varchar(64),
+                PreviousState varchar(64),
+                NewState varchar(64),
+                PayloadJson jsonb,
+                PrevEventHash varchar(64) NOT NULL,
+                EventHash varchar(64) NOT NULL,
+                CreatedAt timestamptz NOT NULL
+            )""",
+        ]
+    else:
+        governance_tables = [
+            """CREATE TABLE WatchlistHits (
+                HitId STRING(36) NOT NULL,
+                SubjectId STRING(36) NOT NULL,
+                ListId STRING(64) NOT NULL,
+                ListName STRING(MAX),
+                Authority STRING(MAX),
+                EntityId STRING(128),
+                SchemaType STRING(64),
+                PrimaryName STRING(MAX),
+                MatchedName STRING(MAX),
+                QueriedName STRING(MAX),
+                QueriedRole STRING(64),
+                MatchScore FLOAT64,
+                MatchStrength STRING(32),
+                DobCorroboration STRING(32),
+                CountryCorroboration STRING(32),
+                HitData JSON,
+                CreatedAt TIMESTAMP NOT NULL,
+                UpdatedAt TIMESTAMP
+            ) PRIMARY KEY (HitId)""",
+            """CREATE TABLE FindingDispositions (
+                DispositionId STRING(36) NOT NULL,
+                SubjectId STRING(36) NOT NULL,
+                ItemId STRING(64) NOT NULL,
+                ItemType STRING(32) NOT NULL,
+                ItemTitle STRING(MAX),
+                Verdict STRING(64) NOT NULL,
+                Rationale STRING(MAX) NOT NULL,
+                MakerEmail STRING(256) NOT NULL,
+                MakerAuthSource STRING(64),
+                CreatedAt TIMESTAMP NOT NULL,
+                UpdatedAt TIMESTAMP NOT NULL
+            ) PRIMARY KEY (DispositionId)""",
+            """CREATE TABLE CaseReviews (
+                SubjectId STRING(36) NOT NULL,
+                ReviewState STRING(64) NOT NULL,
+                ProposedRiskRating STRING(32),
+                ProposedDecision STRING(64),
+                MakerEmail STRING(256),
+                MakerAuthSource STRING(64),
+                MakerRationale STRING(MAX),
+                MakerSubmittedAt TIMESTAMP,
+                CheckerEmail STRING(256),
+                CheckerAuthSource STRING(64),
+                CheckerAction STRING(64),
+                CheckerRationale STRING(MAX),
+                CheckerDecidedAt TIMESTAMP,
+                UpdatedAt TIMESTAMP NOT NULL
+            ) PRIMARY KEY (SubjectId)""",
+            """CREATE TABLE AuditEvents (
+                EventId STRING(36) NOT NULL,
+                SubjectId STRING(36) NOT NULL,
+                EventType STRING(64) NOT NULL,
+                ActorEmail STRING(256) NOT NULL,
+                ActorAuthSource STRING(64),
+                PreviousState STRING(64),
+                NewState STRING(64),
+                PayloadJson JSON,
+                PrevEventHash STRING(64) NOT NULL,
+                EventHash STRING(64) NOT NULL,
+                CreatedAt TIMESTAMP NOT NULL
+            ) PRIMARY KEY (EventId)""",
+        ]
+
+    for stmt in governance_tables:
+        try:
+            op = database.update_ddl([stmt])
+            op.result(timeout=180)
+            logger.info("Created governance table successfully.")
+        except Exception as e:
+            if "already exists" in str(e) or "Duplicate name" in str(e):
+                logger.info("Governance table already exists.")
+            else:
+                logger.warning(f"Governance table creation failed: {e}")
+
     # 3. Secondary indexes.
     #
     # Every query in spanner_client.py filters on SubjectId, yet SubjectId was not
@@ -266,6 +410,9 @@ def apply_schema():
         "CREATE INDEX IDX_GraphEdges_SourceNodeId ON GraphEdges (SourceNodeId)",
         "CREATE INDEX IDX_Subjects_Name ON Subjects (Name)",
         "CREATE INDEX IDX_Subjects_CustomerId ON Subjects (CustomerId)",
+        "CREATE INDEX IDX_WatchlistHits_SubjectId ON WatchlistHits (SubjectId)",
+        "CREATE INDEX IDX_FindingDispositions_SubjectId ON FindingDispositions (SubjectId)",
+        "CREATE INDEX IDX_AuditEvents_Subject_Created ON AuditEvents (SubjectId, CreatedAt)",
     ]
 
     logger.info("Creating secondary indexes...")

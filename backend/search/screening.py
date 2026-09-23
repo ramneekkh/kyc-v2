@@ -30,6 +30,7 @@ MIN_ACCEPTABLE_COVERAGE = 0.90
 RECOMMENDATION_NO_ADVERSE_MEDIA = "No Adverse Media Found"
 RECOMMENDATION_REQUIRES_REVIEW = "Adverse Media - Requires Review"
 RECOMMENDATION_ESCALATE = "Adverse Media - Escalate"
+RECOMMENDATION_SANCTIONS_HIT = "Sanctions / Watchlist Match - Escalate to Compliance / MLRO"
 RECOMMENDATION_INCOMPLETE = "Screening Incomplete - Manual Review Required"
 
 

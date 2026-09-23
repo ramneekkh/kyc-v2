@@ -11,6 +11,7 @@ from .utils import (
     extract_entities_from_bulk_data,
     generate_entity_graph_with_gemini,
     extract_profile_data_with_gemini,
+    finalize_summary,
     DEFAULT_NUM_QUERIES,
 )
 from ..ai_client import DEFAULT_GEMINI_MODEL
@@ -19,15 +20,15 @@ from .screening import (
     SearchCoverage,
     incomplete_screening_summary,
 )
+from .watchlist import screen_subject_watchlists
 from .deduplication import SyndicationFilter
 from .prompts import KYC_SEARCH_QUERY_BRAINSTORMING_PROMPT
 from ..database.spanner_client import spanner_client
 
 # Priority adverse-media query templates.
-#
-# NOTE: these are ADVERSE MEDIA queries. They are not, and cannot be, a substitute
-# for structured sanctions/PEP list screening against OFAC, UN, EU, HMT or MAS
-# lists. See the capability gap noted in the review.
+# Structured sanctions/watchlist screening against SG_MAS, US_OFAC_SDN, UN_SC, and
+# EU_FSF is executed in Step 0.5 via `screen_subject_watchlists` before these
+# open-source media queries run.
 PRIORITY_QUERY_TEMPLATES = [
     '"{subject_name}" AND (launder* OR terror* OR fraud OR corrupt* OR brib* OR traffick* OR "tax evasion" OR arrest* OR embezzle* OR illegal OR "insider deal" OR sanctions OR "sanctions evasion")',
     '"{subject_name}" AND (crime OR investigat* OR alleg* OR convict* OR sentenced OR lawsuit OR litigation OR misdemeanor* OR offen* OR prosecut* OR scam* OR "tax amnesty")',
@@ -39,8 +40,13 @@ PRIORITY_QUERY_TEMPLATES = [
 
 def run_kyc_process(filters):
     """
-    Orchestrates the full KYC process.
-    Yields event dictionaries: {"type": "status"|"result"|"usage_update"|"summary", "data": ...}
+    Orchestrates the full KYC process:
+      0.5 Structured Watchlist & Sanctions Screening (SG_MAS, US_OFAC_SDN, UN_SC, EU_FSF)
+      1.  Priority Adverse Media Searches
+      2.  Gemini Multi-Angle Query Brainstorming & Distributed Searches
+      3.  Full-Text Scraping, Deduplication & Risk Analysis
+      4.  Fail-Closed Summary + Entity Graph Generation
+    Yields event dictionaries: {"type": "status"|"watchlist_results"|"result"|"usage_update"|"summary", "data": ...}
     """
     subject_name = filters.get('subject_name')
     subject_id = filters.get('subject_id')
@@ -65,10 +71,6 @@ def run_kyc_process(filters):
         last_run = spanner_client.get_latest_update_time(subject_id)
         if last_run and filters.get("incremental", False):
             incremental_mode = True
-            # filters["incremental"] = True # Already true if we are here
-            
-            # Calculate days since last run
-            # Handle tz-aware vs naive if needed (Spanner returns aware usually)
             if last_run.tzinfo:
                 now = datetime.datetime.now(datetime.timezone.utc)
             else:
@@ -76,10 +78,6 @@ def run_kyc_process(filters):
                 
             delta = now - last_run
             days_diff = delta.days
-            
-            # Strategy: Use min(days_diff + 1, filters['recency_days'])
-            # The +1 buffer ensures we catch things from the day of the last run.
-            
             new_recency = min(days_diff + 1, int(filters.get('recency_days', 365)))
             filters['recency_days'] = new_recency
             
@@ -88,7 +86,39 @@ def run_kyc_process(filters):
             existing_urls = spanner_client.get_all_finding_urls(subject_id)
         elif last_run:
              yield {"type": "status", "status": "init", "message": "New subject initialized. Creating first scan..."}
-    
+
+    # 0.5 Structured Watchlist & Sanctions Screening (SG_MAS, US_OFAC_SDN, UN_SC, EU_FSF)
+    yield {
+        "type": "status",
+        "status": "performing_watchlist_screening",
+        "message": "Screening against MAS, OFAC SDN, UN Security Council, and EU sanctions lists...",
+    }
+    watchlist_screening = screen_subject_watchlists(filters)
+    yield {"type": "watchlist_results", "data": watchlist_screening}
+
+    if subject_id:
+        try:
+            spanner_client.save_watchlist_hits(subject_id, watchlist_screening.get("hits") or [])
+            spanner_client.append_audit_event(
+                subject_id=subject_id,
+                event_type="WATCHLIST_SCREENING_COMPLETED",
+                actor_email=filters.get("actor_email") or "system@kyc.automated",
+                actor_auth_source=filters.get("actor_auth_source") or "system",
+                previous_state="",
+                new_state=watchlist_screening.get("status") or "CLEAR",
+                payload={
+                    "subject_name": subject_name,
+                    "status": watchlist_screening.get("status"),
+                    "total_hits": watchlist_screening.get("total_hits", 0),
+                    "confirmed_hits": watchlist_screening.get("confirmed_hits", 0),
+                    "strong_hits": watchlist_screening.get("strong_hits", 0),
+                    "potential_hits": watchlist_screening.get("potential_hits", 0),
+                    "coverage": (watchlist_screening.get("coverage") or {}).get("description"),
+                },
+            )
+        except Exception as e:
+            logging.error(f"Failed to persist watchlist hits / audit event: {e}")
+
     # 1. Priority Searches
     yield {"type": "status", "status": "performing_priority_searches", "message": f"Performing {len(PRIORITY_QUERY_TEMPLATES)} priority searches..."}
     
@@ -128,11 +158,6 @@ def run_kyc_process(filters):
         session_usage["cost"] += cost
         yield {"type": "usage_update", "data": session_usage}
     
-    # Enforce the diligence-tier query budget in code. The prompt asks for
-    # exactly this many, but a prompt is a request, not a control: an
-    # over-generating model would otherwise silently blow through the search
-    # quota and starve later subjects in the same pKYC sweep. The model is told
-    # to rank most-informative first, so truncation drops the weakest tail.
     query_budget = int(filters.get('num_queries') or DEFAULT_NUM_QUERIES)
     if gemini_queries and len(gemini_queries) > query_budget:
         logging.info(
@@ -146,12 +171,10 @@ def run_kyc_process(filters):
         yield {"type": "status", "status": "queries_generated", "message": f"Generated {len(gemini_queries)} queries.", "data": gemini_queries}
         yield {"type": "status", "status": "performing_distributed_searches", "message": "Performing distributed searches..."}
         
-        # recency_days is already set based on last_run if incremental
         gemini_search_results, gemini_coverage = perform_google_web_searches(
             gemini_queries, filters['num_results'], filters['recency_days']
         )
         
-        # Deduplicate generic results against DB (URLs)
         if existing_urls:
              gemini_search_results = [r for r in gemini_search_results if r.get('link') not in existing_urls]
     else:
@@ -165,11 +188,11 @@ def run_kyc_process(filters):
     all_search_results = list(priority_results_dict.values()) + list(gemini_results_dict.values())
 
     if not all_search_results:
-        # CRITICAL: zero results is ambiguous. It means either "this subject is clean"
-        # or "we never reached the search API". Only coverage can tell them apart, and
-        # conflating them is how a sanctioned party gets onboarded.
         if not total_coverage.is_complete:
             summary_data = incomplete_screening_summary(subject_name, total_coverage)
+            summary_data = finalize_summary(
+                summary_data, [], total_coverage, watchlist_screening=watchlist_screening
+            )
             logging.error(
                 f"Screening for '{subject_name}' returned no results with degraded coverage: "
                 f"{total_coverage.describe()} Refusing to report a clean result."
@@ -199,6 +222,9 @@ def run_kyc_process(filters):
             "reasoning": "No adverse media returned by the sources searched.",
             "screening_coverage": total_coverage.to_dict(),
         }
+        summary_data = finalize_summary(
+            summary_data, [], total_coverage, watchlist_screening=watchlist_screening
+        )
         if subject_id:
             try:
                 spanner_client.update_subject_summary(subject_id, json.dumps(summary_data))
@@ -211,13 +237,6 @@ def run_kyc_process(filters):
     yield {"type": "status", "status": "analyzing_results", "message": f"Analyzing {len(all_search_results)} sources..."}
 
     # 4. Analyze
-    # If incremental, we need to consider ALL findings for graph/summary, but only analyze NEW ones for risk.
-    # Actually, analyze_kyc_results handles saving batch of NEW results.
-    # It also handles generating summary.
-    # If we want summary to include OLD results, we must pass them in.
-    
-    # 4. Analyze
-    # Load previous findings and hashes for ALL modes to ensure deduplication and full graph context
     previous_findings = spanner_client.get_findings(subject_id)
     existing_url_hashes = {}
     existing_url_fingerprints = {}
@@ -229,18 +248,10 @@ def run_kyc_process(filters):
         u_hashes, c_hashes, u_fingerprints = spanner_client.get_existing_hashes_and_ids(subject_id)
         syndication_filter.preload_hashes(c_hashes)
         existing_url_hashes = u_hashes
-        # Fingerprints let the analyzer distinguish "seen this URL" from
-        # "seen this URL with this content", so amended or retracted stories
-        # are re-assessed instead of inheriting a stale verdict.
         existing_url_fingerprints = u_fingerprints
         yield {"type": "status", "status": "dedup_loaded", "message": f"Loaded {len(c_hashes)} content hashes and {len(u_hashes)} URL hashes for deduplication."}
     except Exception as e:
         logging.error(f"Failed to preload hashes: {e}")
-
-    # In incremental mode, we trust that we only searched for recent stuff.
-    # In full mode, we searched everything, but we deduplicate against existing_url_hashes in analyze_kyc_results.
-    # So we effectively "Fill Gaps".
-
 
     analysis_generator = analyze_kyc_results(
         all_search_results,
@@ -252,6 +263,7 @@ def run_kyc_process(filters):
         existing_url_fingerprints=existing_url_fingerprints,
         coverage=total_coverage,
         session_usage=session_usage,
+        watchlist_screening=watchlist_screening,
     )
     
     collected_new_findings = []

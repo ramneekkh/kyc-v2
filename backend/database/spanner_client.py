@@ -790,5 +790,574 @@ class SpannerClient:
             logger.error(f"Error fetching finding URLs for {subject_id}: {e}")
             return set()
 
+    # -----------------------------------------------------------------------
+    # Watchlist Hits & Four-Eyes Maker-Checker Governance Persistence
+    # -----------------------------------------------------------------------
+
+    def _ensure_mem_governance(self):
+        if not hasattr(self, "_mem_watchlist_hits"):
+            self._mem_watchlist_hits = {}
+            self._mem_dispositions = {}
+            self._mem_case_reviews = {}
+            self._mem_audit_events = {}
+            self._gov_lock = threading.RLock()
+
+    def _is_pg_dialect(self) -> bool:
+        dialect = self._get_dialect()
+        try:
+            return (dialect == 2) or "POSTGRESQL" in getattr(dialect, "name", str(dialect)).upper()
+        except Exception:
+            return dialect == 2
+
+    def save_watchlist_hits(self, subject_id: str, hits: list) -> None:
+        """Persists structured watchlist/sanctions matches for `subject_id`."""
+        if not subject_id:
+            return
+        self._ensure_mem_governance()
+        now_dt = datetime.utcnow()
+        with self._gov_lock:
+            self._mem_watchlist_hits[subject_id] = [dict(h) for h in (hits or [])]
+
+        self.connect()
+        if not self.database or not hits:
+            return
+
+        try:
+            columns = [
+                "HitId",
+                "SubjectId",
+                "ListId",
+                "ListName",
+                "Authority",
+                "EntityId",
+                "SchemaType",
+                "PrimaryName",
+                "MatchedName",
+                "QueriedName",
+                "QueriedRole",
+                "MatchScore",
+                "MatchStrength",
+                "DobCorroboration",
+                "CountryCorroboration",
+                "HitData",
+                "CreatedAt",
+                "UpdatedAt",
+            ]
+            rows = []
+            for h in hits:
+                hit_id = h.get("hit_id") or str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_OID,
+                        f"{subject_id}:{h.get('list_id')}:{h.get('entity_id')}",
+                    )
+                )
+                rows.append([
+                    hit_id,
+                    subject_id,
+                    h.get("list_id") or "",
+                    h.get("list_name") or "",
+                    h.get("authority") or "",
+                    h.get("entity_id") or "",
+                    h.get("schema_type") or "",
+                    h.get("primary_name") or "",
+                    h.get("matched_name") or "",
+                    h.get("queried_name") or "",
+                    h.get("queried_role") or "subject",
+                    float(h.get("match_score") or 0.0),
+                    h.get("match_strength") or "POTENTIAL",
+                    h.get("dob_corroboration") or "UNAVAILABLE",
+                    h.get("country_corroboration") or "UNAVAILABLE",
+                    json.dumps(h),
+                    now_dt,
+                    now_dt,
+                ])
+            with self.database.batch() as batch:
+                batch.insert_or_update(table="WatchlistHits", columns=columns, values=rows)
+        except Exception as e:
+            logger.error(f"Error saving watchlist hits for {subject_id}: {e}")
+
+    def get_watchlist_hits(self, subject_id: str) -> list:
+        """Returns persisted watchlist hits for `subject_id`, ordered by score desc."""
+        if not subject_id:
+            return []
+        self._ensure_mem_governance()
+        self.connect()
+        if not self.database:
+            with self._gov_lock:
+                return list(self._mem_watchlist_hits.get(subject_id, []))
+
+        try:
+            is_pg = self._is_pg_dialect()
+            with self.database.snapshot() as snapshot:
+                if is_pg:
+                    query = (
+                        "SELECT HitId, ListId, ListName, Authority, EntityId, SchemaType, "
+                        "PrimaryName, MatchedName, QueriedName, QueriedRole, MatchScore, "
+                        "MatchStrength, DobCorroboration, CountryCorroboration, HitData "
+                        "FROM WatchlistHits WHERE SubjectId = $1 ORDER BY MatchScore DESC"
+                    )
+                    params = {"p1": subject_id}
+                    p_types = {"p1": spanner.param_types.STRING}
+                else:
+                    query = (
+                        "SELECT HitId, ListId, ListName, Authority, EntityId, SchemaType, "
+                        "PrimaryName, MatchedName, QueriedName, QueriedRole, MatchScore, "
+                        "MatchStrength, DobCorroboration, CountryCorroboration, HitData "
+                        "FROM WatchlistHits WHERE SubjectId = @subject_id ORDER BY MatchScore DESC"
+                    )
+                    params = {"subject_id": subject_id}
+                    p_types = {"subject_id": spanner.param_types.STRING}
+
+                results = snapshot.execute_sql(query, params=params, param_types=p_types)
+                out = []
+                for row in results:
+                    raw_json = row[14]
+                    parsed = {}
+                    if isinstance(raw_json, dict):
+                        parsed = dict(raw_json)
+                    elif isinstance(raw_json, str) and raw_json:
+                        try:
+                            parsed = json.loads(raw_json)
+                        except Exception:
+                            parsed = {}
+                    parsed.update({
+                        "hit_id": row[0],
+                        "list_id": row[1],
+                        "list_name": row[2],
+                        "authority": row[3],
+                        "entity_id": row[4],
+                        "schema_type": row[5],
+                        "primary_name": row[6],
+                        "matched_name": row[7],
+                        "queried_name": row[8],
+                        "queried_role": row[9],
+                        "match_score": float(row[10] or 0.0),
+                        "match_strength": row[11],
+                        "dob_corroboration": row[12],
+                        "country_corroboration": row[13],
+                    })
+                    out.append(parsed)
+                return out
+        except Exception as e:
+            logger.error(f"Error fetching watchlist hits for {subject_id}: {e}")
+            with self._gov_lock:
+                return list(self._mem_watchlist_hits.get(subject_id, []))
+
+    def upsert_finding_disposition(
+        self,
+        subject_id: str,
+        item_id: str,
+        item_type: str,
+        item_title: str,
+        verdict: str,
+        rationale: str,
+        maker_email: str,
+        maker_auth_source: str,
+    ) -> dict:
+        """Records or updates a Maker disposition on a Finding or WatchlistHit."""
+        self._ensure_mem_governance()
+        now_dt = datetime.utcnow()
+        now_iso = now_dt.replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
+        disposition_id = str(
+            uuid.uuid5(uuid.NAMESPACE_OID, f"disp:{subject_id}:{item_id}")
+        )
+        record = {
+            "disposition_id": disposition_id,
+            "subject_id": subject_id,
+            "item_id": item_id,
+            "item_type": item_type,
+            "item_title": item_title or "",
+            "verdict": verdict,
+            "rationale": rationale,
+            "maker_email": maker_email,
+            "maker_auth_source": maker_auth_source,
+            "updated_at": now_iso,
+        }
+        with self._gov_lock:
+            self._mem_dispositions.setdefault(subject_id, {})[item_id] = record
+
+        self.connect()
+        if self.database:
+            try:
+                with self.database.batch() as batch:
+                    batch.insert_or_update(
+                        table="FindingDispositions",
+                        columns=[
+                            "DispositionId",
+                            "SubjectId",
+                            "ItemId",
+                            "ItemType",
+                            "ItemTitle",
+                            "Verdict",
+                            "Rationale",
+                            "MakerEmail",
+                            "MakerAuthSource",
+                            "CreatedAt",
+                            "UpdatedAt",
+                        ],
+                        values=[[
+                            disposition_id,
+                            subject_id,
+                            item_id,
+                            item_type,
+                            item_title or "",
+                            verdict,
+                            rationale,
+                            maker_email,
+                            maker_auth_source or "",
+                            now_dt,
+                            now_dt,
+                        ]],
+                    )
+            except Exception as e:
+                logger.error(f"Error saving disposition {disposition_id}: {e}")
+        return record
+
+    def get_finding_dispositions(self, subject_id: str) -> dict:
+        """Returns `{item_id: disposition_dict}` for `subject_id`."""
+        if not subject_id:
+            return {}
+        self._ensure_mem_governance()
+        self.connect()
+        if not self.database:
+            with self._gov_lock:
+                return dict(self._mem_dispositions.get(subject_id, {}))
+
+        try:
+            is_pg = self._is_pg_dialect()
+            with self.database.snapshot() as snapshot:
+                if is_pg:
+                    query = (
+                        "SELECT DispositionId, ItemId, ItemType, ItemTitle, Verdict, "
+                        "Rationale, MakerEmail, MakerAuthSource, UpdatedAt "
+                        "FROM FindingDispositions WHERE SubjectId = $1"
+                    )
+                    params = {"p1": subject_id}
+                    p_types = {"p1": spanner.param_types.STRING}
+                else:
+                    query = (
+                        "SELECT DispositionId, ItemId, ItemType, ItemTitle, Verdict, "
+                        "Rationale, MakerEmail, MakerAuthSource, UpdatedAt "
+                        "FROM FindingDispositions WHERE SubjectId = @subject_id"
+                    )
+                    params = {"subject_id": subject_id}
+                    p_types = {"subject_id": spanner.param_types.STRING}
+
+                results = snapshot.execute_sql(query, params=params, param_types=p_types)
+                dispositions = {}
+                for row in results:
+                    dispositions[row[1]] = {
+                        "disposition_id": row[0],
+                        "subject_id": subject_id,
+                        "item_id": row[1],
+                        "item_type": row[2],
+                        "item_title": row[3],
+                        "verdict": row[4],
+                        "rationale": row[5],
+                        "maker_email": row[6],
+                        "maker_auth_source": row[7],
+                        "updated_at": row[8].isoformat() if row[8] else None,
+                    }
+                return dispositions
+        except Exception as e:
+            logger.error(f"Error reading dispositions for {subject_id}: {e}")
+            with self._gov_lock:
+                return dict(self._mem_dispositions.get(subject_id, {}))
+
+    def get_case_review(self, subject_id: str) -> dict:
+        """Returns the current Four-Eyes CaseReview state for `subject_id`."""
+        default_review = {
+            "subject_id": subject_id,
+            "review_state": "UNREVIEWED",
+            "proposed_risk_rating": None,
+            "proposed_decision": None,
+            "maker_email": None,
+            "maker_auth_source": None,
+            "maker_rationale": None,
+            "maker_submitted_at": None,
+            "checker_email": None,
+            "checker_auth_source": None,
+            "checker_action": None,
+            "checker_rationale": None,
+            "checker_decided_at": None,
+            "updated_at": None,
+        }
+        if not subject_id:
+            return default_review
+        self._ensure_mem_governance()
+        self.connect()
+        if not self.database:
+            with self._gov_lock:
+                return dict(self._mem_case_reviews.get(subject_id, default_review))
+
+        try:
+            is_pg = self._is_pg_dialect()
+            with self.database.snapshot() as snapshot:
+                if is_pg:
+                    query = (
+                        "SELECT ReviewState, ProposedRiskRating, ProposedDecision, "
+                        "MakerEmail, MakerAuthSource, MakerRationale, MakerSubmittedAt, "
+                        "CheckerEmail, CheckerAuthSource, CheckerAction, CheckerRationale, "
+                        "CheckerDecidedAt, UpdatedAt FROM CaseReviews WHERE SubjectId = $1"
+                    )
+                    params = {"p1": subject_id}
+                    p_types = {"p1": spanner.param_types.STRING}
+                else:
+                    query = (
+                        "SELECT ReviewState, ProposedRiskRating, ProposedDecision, "
+                        "MakerEmail, MakerAuthSource, MakerRationale, MakerSubmittedAt, "
+                        "CheckerEmail, CheckerAuthSource, CheckerAction, CheckerRationale, "
+                        "CheckerDecidedAt, UpdatedAt FROM CaseReviews WHERE SubjectId = @subject_id"
+                    )
+                    params = {"subject_id": subject_id}
+                    p_types = {"subject_id": spanner.param_types.STRING}
+
+                results = snapshot.execute_sql(query, params=params, param_types=p_types)
+                for row in results:
+                    return {
+                        "subject_id": subject_id,
+                        "review_state": row[0] or "UNREVIEWED",
+                        "proposed_risk_rating": row[1],
+                        "proposed_decision": row[2],
+                        "maker_email": row[3],
+                        "maker_auth_source": row[4],
+                        "maker_rationale": row[5],
+                        "maker_submitted_at": row[6].isoformat() if row[6] else None,
+                        "checker_email": row[7],
+                        "checker_auth_source": row[8],
+                        "checker_action": row[9],
+                        "checker_rationale": row[10],
+                        "checker_decided_at": row[11].isoformat() if row[11] else None,
+                        "updated_at": row[12].isoformat() if row[12] else None,
+                    }
+                return default_review
+        except Exception as e:
+            logger.error(f"Error reading case review for {subject_id}: {e}")
+            with self._gov_lock:
+                return dict(self._mem_case_reviews.get(subject_id, default_review))
+
+    def save_case_review(self, review: dict) -> dict:
+        """Persists a CaseReview state transition."""
+        subject_id = review.get("subject_id")
+        if not subject_id:
+            return review
+        self._ensure_mem_governance()
+        now_dt = datetime.utcnow()
+        now_iso = now_dt.isoformat() + "Z"
+        updated = dict(review)
+        updated["updated_at"] = now_iso
+        with self._gov_lock:
+            self._mem_case_reviews[subject_id] = updated
+
+        self.connect()
+        if self.database:
+            try:
+                with self.database.batch() as batch:
+                    batch.insert_or_update(
+                        table="CaseReviews",
+                        columns=[
+                            "SubjectId",
+                            "ReviewState",
+                            "ProposedRiskRating",
+                            "ProposedDecision",
+                            "MakerEmail",
+                            "MakerAuthSource",
+                            "MakerRationale",
+                            "MakerSubmittedAt",
+                            "CheckerEmail",
+                            "CheckerAuthSource",
+                            "CheckerAction",
+                            "CheckerRationale",
+                            "CheckerDecidedAt",
+                            "UpdatedAt",
+                        ],
+                        values=[[
+                            subject_id,
+                            updated.get("review_state") or "UNREVIEWED",
+                            updated.get("proposed_risk_rating"),
+                            updated.get("proposed_decision"),
+                            updated.get("maker_email"),
+                            updated.get("maker_auth_source"),
+                            updated.get("maker_rationale"),
+                            _coerce_timestamp(updated.get("maker_submitted_at")),
+                            updated.get("checker_email"),
+                            updated.get("checker_auth_source"),
+                            updated.get("checker_action"),
+                            updated.get("checker_rationale"),
+                            _coerce_timestamp(updated.get("checker_decided_at")),
+                            now_dt,
+                        ]],
+                    )
+            except Exception as e:
+                logger.error(f"Error saving case review for {subject_id}: {e}")
+        return updated
+
+    def append_audit_event(
+        self,
+        subject_id: str,
+        event_type: str,
+        actor_email: str,
+        actor_auth_source: str,
+        previous_state: str,
+        new_state: str,
+        payload: dict,
+    ) -> dict:
+        """
+        Appends an immutable, SHA-256 hash-chained audit event to `AuditEvents`.
+        Never updates or deletes existing rows.
+        """
+        from ..governance import GENESIS_HASH, compute_audit_event_hash
+
+        self._ensure_mem_governance()
+        with self._gov_lock:
+            existing = self.get_audit_events(subject_id)
+            prev_hash = existing[-1]["event_hash"] if existing else GENESIS_HASH
+            now_dt = datetime.utcnow()
+            # Ensure strictly monotonic ISO timestamp within the same subject chain
+            created_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            if existing and created_iso <= (existing[-1].get("created_at") or ""):
+                # Increment microseconds by 1 to keep deterministic sort order
+                bump = now_dt.microsecond + 1
+                created_iso = now_dt.replace(microsecond=min(999999, bump)).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                )
+
+            event_id = str(uuid.uuid4())
+            clean_payload = payload if isinstance(payload, dict) else {}
+            event_hash = compute_audit_event_hash(
+                prev_hash=prev_hash,
+                created_at_iso=created_iso,
+                subject_id=subject_id,
+                event_type=event_type,
+                actor_email=actor_email,
+                payload=clean_payload,
+            )
+
+            event_record = {
+                "event_id": event_id,
+                "subject_id": subject_id,
+                "event_type": event_type,
+                "actor_email": actor_email,
+                "actor_auth_source": actor_auth_source or "",
+                "previous_state": previous_state or "",
+                "new_state": new_state or "",
+                "payload": clean_payload,
+                "prev_event_hash": prev_hash,
+                "event_hash": event_hash,
+                "created_at": created_iso,
+            }
+            self._mem_audit_events.setdefault(subject_id, []).append(event_record)
+
+            self.connect()
+            if self.database:
+                try:
+                    with self.database.batch() as batch:
+                        batch.insert(
+                            table="AuditEvents",
+                            columns=[
+                                "EventId",
+                                "SubjectId",
+                                "EventType",
+                                "ActorEmail",
+                                "ActorAuthSource",
+                                "PreviousState",
+                                "NewState",
+                                "PayloadJson",
+                                "PrevEventHash",
+                                "EventHash",
+                                "CreatedAt",
+                            ],
+                            values=[[
+                                event_id,
+                                subject_id,
+                                event_type,
+                                actor_email,
+                                actor_auth_source or "",
+                                previous_state or "",
+                                new_state or "",
+                                json.dumps(clean_payload),
+                                prev_hash,
+                                event_hash,
+                                _coerce_timestamp(created_iso),
+                            ]],
+                        )
+                except Exception as e:
+                    logger.error(f"Error appending audit event {event_id}: {e}")
+            return event_record
+
+    def get_audit_events(self, subject_id: str) -> list:
+        """Returns all audit events for `subject_id` in chronological order (oldest first)."""
+        if not subject_id:
+            return []
+        self._ensure_mem_governance()
+        self.connect()
+        if not self.database:
+            with self._gov_lock:
+                return sorted(
+                    list(self._mem_audit_events.get(subject_id, [])),
+                    key=lambda e: e.get("created_at") or "",
+                )
+
+        try:
+            is_pg = self._is_pg_dialect()
+            with self.database.snapshot() as snapshot:
+                if is_pg:
+                    query = (
+                        "SELECT EventId, EventType, ActorEmail, ActorAuthSource, "
+                        "PreviousState, NewState, PayloadJson, PrevEventHash, EventHash, CreatedAt "
+                        "FROM AuditEvents WHERE SubjectId = $1 ORDER BY CreatedAt ASC"
+                    )
+                    params = {"p1": subject_id}
+                    p_types = {"p1": spanner.param_types.STRING}
+                else:
+                    query = (
+                        "SELECT EventId, EventType, ActorEmail, ActorAuthSource, "
+                        "PreviousState, NewState, PayloadJson, PrevEventHash, EventHash, CreatedAt "
+                        "FROM AuditEvents WHERE SubjectId = @subject_id ORDER BY CreatedAt ASC"
+                    )
+                    params = {"subject_id": subject_id}
+                    p_types = {"subject_id": spanner.param_types.STRING}
+
+                results = snapshot.execute_sql(query, params=params, param_types=p_types)
+                events = []
+                for row in results:
+                    raw_payload = row[6]
+                    parsed_payload = {}
+                    if isinstance(raw_payload, dict):
+                        parsed_payload = raw_payload
+                    elif isinstance(raw_payload, str) and raw_payload:
+                        try:
+                            parsed_payload = json.loads(raw_payload)
+                        except Exception:
+                            parsed_payload = {}
+                    created_dt = row[9]
+                    created_iso = (
+                        created_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                        if created_dt
+                        else ""
+                    )
+                    events.append({
+                        "event_id": row[0],
+                        "subject_id": subject_id,
+                        "event_type": row[1],
+                        "actor_email": row[2],
+                        "actor_auth_source": row[3] or "",
+                        "previous_state": row[4] or "",
+                        "new_state": row[5] or "",
+                        "payload": parsed_payload,
+                        "prev_event_hash": row[7] or "",
+                        "event_hash": row[8] or "",
+                        "created_at": created_iso,
+                    })
+                return events
+        except Exception as e:
+            logger.error(f"Error reading audit events for {subject_id}: {e}")
+            with self._gov_lock:
+                return sorted(
+                    list(self._mem_audit_events.get(subject_id, [])),
+                    key=lambda e: e.get("created_at") or "",
+                )
+
+
 # Global instance
 spanner_client = SpannerClient()

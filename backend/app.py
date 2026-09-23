@@ -30,7 +30,25 @@ import time
 import concurrent.futures
 from flask import Flask, jsonify, request, send_from_directory, abort, Response, stream_with_context
 import uuid
-from .search.screening import RECOMMENDATION_INCOMPLETE, RECOMMENDATION_NO_ADVERSE_MEDIA
+from .search.screening import (
+    RECOMMENDATION_INCOMPLETE,
+    RECOMMENDATION_NO_ADVERSE_MEDIA,
+    RECOMMENDATION_SANCTIONS_HIT,
+)
+from .search.watchlist import screen_subject_watchlists, watchlist_index
+from .governance import (
+    CASE_DECISIONS,
+    CASE_STATES,
+    DISPOSITION_VERDICTS,
+    FourEyesViolationError,
+    GovernanceValidationError,
+    VALID_RISK_RATINGS,
+    extract_reviewer_identity,
+    validate_checker_decision,
+    validate_disposition_input,
+    validate_maker_submission,
+    verify_audit_chain,
+)
 # Import Spanner Client
 from .database.spanner_client import spanner_client
 from .database.schema_manager import apply_schema
@@ -278,6 +296,7 @@ def _register_api_routes(app: Flask):
         # --- Persistence: Generate Subject ID and Save ---
         # Keyed on the institution's customer identifier where available; see
         # backend/identity.py for why a name is not an acceptable primary key.
+        reviewer = extract_reviewer_identity(request)
         subject_id, key_strategy = derive_subject_id(
             subject_name,
             customer_id=customer_id,
@@ -285,6 +304,8 @@ def _register_api_routes(app: Flask):
         )
         filters['subject_id'] = subject_id
         filters['key_strategy'] = key_strategy
+        filters['actor_email'] = reviewer.effective_email
+        filters['actor_auth_source'] = reviewer.auth_source
 
         # Save Subject to Spanner (Non-blocking or fast enough)
         try:
@@ -296,7 +317,13 @@ def _register_api_routes(app: Flask):
             # Tracks whether the run ended in a defensible state. The client must
             # be told explicitly: a silently-closed stream is indistinguishable
             # from a crashed one, and "the spinner stopped" is not a verdict.
-            outcome = {"status": "complete", "message": "Screening complete.", "screening_incomplete": False}
+            outcome = {
+                "status": "complete",
+                "message": "Screening complete.",
+                "screening_incomplete": False,
+                "subject_id": subject_id,
+            }
+            yield f'data: {json.dumps({"status": "subject_initialized", "subject_id": subject_id, "reviewer": reviewer.to_dict()})}\n\n'
             try:
                 # Use shared core logic
                 process_generator = run_kyc_process(filters)
@@ -308,8 +335,11 @@ def _register_api_routes(app: Flask):
                         if event.get("status") == "screening_incomplete":
                             outcome["screening_incomplete"] = True
                             outcome["message"] = event.get("message") or "Screening could not be completed."
-                        yield f'data: {json.dumps({"status": event.get("status"), "message": event.get("message"), "data": event.get("data")})}\n\n'
+                        yield f'data: {json.dumps({"status": event.get("status"), "message": event.get("message"), "data": event.get("data"), "subject_id": subject_id})}\n\n'
                     
+                    elif event_type == "watchlist_results":
+                        yield f'data: {json.dumps({"status": "watchlist_results", "message": "Sanctions watchlist screening completed.", "data": event.get("data"), "subject_id": subject_id})}\n\n'
+
                     elif event_type == "usage_update":
                         yield f'data: {json.dumps({"status": "usage_update", "data": event.get("data")})}\n\n'
                         
@@ -317,7 +347,7 @@ def _register_api_routes(app: Flask):
                         yield f'data: {json.dumps({"status": "kyc_result_generated", "message": "Analyzed a source.", "data": event.get("data")})}\n\n'
                         
                     elif event_type == "summary":
-                        yield f'data: {json.dumps({"status": "kyc_summary_generated", "message": "Overall assessment complete.", "data": event.get("data")})}\n\n'
+                        yield f'data: {json.dumps({"status": "kyc_summary_generated", "message": "Overall assessment complete.", "data": event.get("data"), "subject_id": subject_id})}\n\n'
                     
                     elif event_type == "graph_data":
                         yield f'data: {json.dumps({"status": "kyc_graph_generated", "message": "Entity graph generated.", "data": event.get("data")})}\n\n'
@@ -873,22 +903,366 @@ def _register_api_routes(app: Flask):
 
             findings = spanner_client.get_findings(subject_id)
             graph_data = spanner_client.get_graph_data(subject_id)
+            watchlist_hits = spanner_client.get_watchlist_hits(subject_id)
+            case_review = spanner_client.get_case_review(subject_id)
+            dispositions = spanner_client.get_finding_dispositions(subject_id)
+            audit_events = spanner_client.get_audit_events(subject_id)
+            audit_verification = verify_audit_chain(audit_events)
+            reviewer = extract_reviewer_identity(request)
             
             return jsonify({
                 "subject": subject,
                 "findings": findings,
-                "graph_data": graph_data
+                "graph_data": graph_data,
+                "watchlist_hits": watchlist_hits,
+                "case_review": case_review,
+                "dispositions": dispositions,
+                "audit_events": audit_events,
+                "audit_chain_verification": audit_verification,
+                "reviewer": reviewer.to_dict(),
             })
         except Exception as e:
             logging.error(f"Failed to get details for {subject_id}: {e}")
             return jsonify({"error": str(e)}), 500
 
+    # -----------------------------------------------------------------------
+    # Watchlist / Sanctions Screening & Maker-Checker Governance Endpoints
+    # -----------------------------------------------------------------------
+
+    @app.route('/api/watchlist/status', methods=['GET'])
+    def get_watchlist_status():
+        """Returns live coverage and entity counts for SG_MAS, US_OFAC_SDN, UN_SC, and EU_FSF."""
+        try:
+            return jsonify(watchlist_index.get_status())
+        except Exception as e:
+            logging.error(f"Failed to fetch watchlist status: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route('/api/watchlist/refresh', methods=['POST'])
+    def refresh_watchlists():
+        """Forces an immediate live refresh of all sanctions watchlists from upstream authorities."""
+        try:
+            cov = watchlist_index.ensure_loaded(force_refresh=True)
+            return jsonify(cov.to_dict()), (200 if cov.is_complete else 503)
+        except Exception as e:
+            logging.error(f"Failed to refresh watchlists: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route('/api/watchlist/screen', methods=['POST'])
+    def screen_watchlist_endpoint():
+        """Standalone instant sanctions & watchlist screening endpoint."""
+        data = request.get_json(silent=True) or {}
+        subject_name = (data.get('subject_name') or data.get('subjectName') or '').strip()
+        if not subject_name:
+            return jsonify({"error": "subject_name is required"}), 400
+        filters = {
+            "subject_name": subject_name,
+            "alias": data.get("alias") or data.get("aliases") or "",
+            "dob": data.get("dob") or "",
+            "age": data.get("age") or "",
+            "region": data.get("region") or data.get("country") or "",
+            "company": data.get("company") or "",
+            "ownership": data.get("ownership") or "",
+            "spouse": data.get("spouse") or "",
+        }
+        result = screen_subject_watchlists(filters)
+        return jsonify(result)
+
+    @app.route('/api/governance/me', methods=['GET'])
+    def get_current_reviewer():
+        """Returns the authenticated IAP reviewer identity and governance vocabularies."""
+        reviewer = extract_reviewer_identity(request)
+        return jsonify({
+            "reviewer": reviewer.to_dict(),
+            "vocabularies": {
+                "disposition_verdicts": DISPOSITION_VERDICTS,
+                "case_decisions": CASE_DECISIONS,
+                "risk_ratings": list(VALID_RISK_RATINGS),
+                "case_states": list(CASE_STATES),
+            },
+        })
+
+    @app.route('/api/subjects/<subject_id>/governance', methods=['GET'])
+    def get_subject_governance(subject_id):
+        """Returns full Maker-Checker state, item dispositions, watchlist hits, and hash-chained audit log."""
+        reviewer = extract_reviewer_identity(request)
+        case_review = spanner_client.get_case_review(subject_id)
+        dispositions = spanner_client.get_finding_dispositions(subject_id)
+        watchlist_hits = spanner_client.get_watchlist_hits(subject_id)
+        audit_events = spanner_client.get_audit_events(subject_id)
+        audit_verification = verify_audit_chain(audit_events)
+        return jsonify({
+            "subject_id": subject_id,
+            "reviewer": reviewer.to_dict(),
+            "case_review": case_review,
+            "dispositions": dispositions,
+            "watchlist_hits": watchlist_hits,
+            "audit_events": audit_events,
+            "audit_chain_verification": audit_verification,
+            "vocabularies": {
+                "disposition_verdicts": DISPOSITION_VERDICTS,
+                "case_decisions": CASE_DECISIONS,
+                "risk_ratings": list(VALID_RISK_RATINGS),
+                "case_states": list(CASE_STATES),
+            },
+        })
+
+    @app.route('/api/subjects/<subject_id>/dispositions', methods=['POST'])
+    def record_item_disposition(subject_id):
+        """Maker records a disposition and written rationale on a Finding or WatchlistHit."""
+        reviewer = extract_reviewer_identity(request)
+        data = request.get_json(silent=True) or {}
+
+        # A locked/approved case cannot have its findings mutated without reopening
+        current_review = spanner_client.get_case_review(subject_id)
+        if current_review.get("review_state") == "APPROVED":
+            return jsonify({
+                "error": "Case is locked in APPROVED state. A Checker must return the case to Maker before dispositions can be changed."
+            }), 409
+
+        try:
+            item_type, verdict, rationale = validate_disposition_input(
+                item_id=data.get("item_id"),
+                item_type=data.get("item_type", "FINDING"),
+                verdict=data.get("verdict"),
+                rationale=data.get("rationale"),
+            )
+        except GovernanceValidationError as e:
+            return jsonify({"error": str(e)}), 400
+
+        item_id = str(data.get("item_id")).strip()
+        item_title = (data.get("item_title") or item_id).strip()
+
+        disp = spanner_client.upsert_finding_disposition(
+            subject_id=subject_id,
+            item_id=item_id,
+            item_type=item_type,
+            item_title=item_title,
+            verdict=verdict,
+            rationale=rationale,
+            maker_email=reviewer.effective_email,
+            maker_auth_source=reviewer.auth_source,
+        )
+
+        prev_state = current_review.get("review_state") or "UNREVIEWED"
+        new_state = "IN_MAKER_REVIEW" if prev_state in ("UNREVIEWED", "RETURNED_TO_MAKER") else prev_state
+        if new_state != prev_state:
+            current_review["review_state"] = new_state
+            spanner_client.save_case_review(current_review)
+
+        audit_event = spanner_client.append_audit_event(
+            subject_id=subject_id,
+            event_type="ITEM_DISPOSITION_RECORDED",
+            actor_email=reviewer.effective_email,
+            actor_auth_source=reviewer.auth_source,
+            previous_state=prev_state,
+            new_state=new_state,
+            payload={
+                "item_id": item_id,
+                "item_type": item_type,
+                "item_title": item_title,
+                "verdict": verdict,
+                "rationale": rationale,
+                "authenticated_iap_email": reviewer.authenticated_email,
+            },
+        )
+
+        all_events = spanner_client.get_audit_events(subject_id)
+        return jsonify({
+            "disposition": disp,
+            "case_review": current_review,
+            "dispositions": spanner_client.get_finding_dispositions(subject_id),
+            "audit_event": audit_event,
+            "audit_events": all_events,
+            "audit_chain_verification": verify_audit_chain(all_events),
+        })
+
+    @app.route('/api/subjects/<subject_id>/review/submit', methods=['POST'])
+    def submit_maker_case_review(subject_id):
+        """Maker submits the case risk rating, decision, and justification for Checker sign-off."""
+        import datetime as _dt
+
+        reviewer = extract_reviewer_identity(request)
+        data = request.get_json(silent=True) or {}
+
+        proposed_risk_rating = (data.get("proposed_risk_rating") or "").strip()
+        proposed_decision = (data.get("proposed_decision") or "").strip()
+        maker_rationale = (data.get("maker_rationale") or "").strip()
+
+        dispositions = spanner_client.get_finding_dispositions(subject_id)
+        watchlist_hits = spanner_client.get_watchlist_hits(subject_id)
+
+        # Load required human-review items from persisted subject summary if available
+        required_review_items = []
+        subject_row = spanner_client.get_subject(subject_id)
+        if subject_row and subject_row.get("summary"):
+            try:
+                s_obj = json.loads(subject_row["summary"])
+                required_review_items = s_obj.get("requires_human_review") or []
+            except Exception:
+                required_review_items = []
+
+        try:
+            validate_maker_submission(
+                proposed_risk_rating=proposed_risk_rating,
+                proposed_decision=proposed_decision,
+                maker_rationale=maker_rationale,
+                dispositions_by_item=dispositions,
+                watchlist_hits=watchlist_hits,
+                required_review_items=required_review_items,
+            )
+        except GovernanceValidationError as e:
+            return jsonify({"error": str(e)}), 400
+
+        current_review = spanner_client.get_case_review(subject_id)
+        prev_state = current_review.get("review_state") or "UNREVIEWED"
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        updated_review = {
+            "subject_id": subject_id,
+            "review_state": "PENDING_CHECKER_APPROVAL",
+            "proposed_risk_rating": proposed_risk_rating,
+            "proposed_decision": proposed_decision,
+            "maker_email": reviewer.effective_email,
+            "maker_auth_source": reviewer.auth_source,
+            "maker_rationale": maker_rationale,
+            "maker_submitted_at": now_iso,
+            "checker_email": None,
+            "checker_auth_source": None,
+            "checker_action": None,
+            "checker_rationale": None,
+            "checker_decided_at": None,
+        }
+        saved_review = spanner_client.save_case_review(updated_review)
+
+        audit_event = spanner_client.append_audit_event(
+            subject_id=subject_id,
+            event_type="CASE_SUBMITTED_FOR_CHECKER_APPROVAL",
+            actor_email=reviewer.effective_email,
+            actor_auth_source=reviewer.auth_source,
+            previous_state=prev_state,
+            new_state="PENDING_CHECKER_APPROVAL",
+            payload={
+                "proposed_risk_rating": proposed_risk_rating,
+                "proposed_decision": proposed_decision,
+                "maker_rationale": maker_rationale,
+                "disposition_count": len(dispositions),
+                "authenticated_iap_email": reviewer.authenticated_email,
+            },
+        )
+        all_events = spanner_client.get_audit_events(subject_id)
+        return jsonify({
+            "case_review": saved_review,
+            "audit_event": audit_event,
+            "audit_events": all_events,
+            "audit_chain_verification": verify_audit_chain(all_events),
+        })
+
+    @app.route('/api/subjects/<subject_id>/review/decide', methods=['POST'])
+    def decide_checker_case_review(subject_id):
+        """
+        Checker approves, returns to Maker, or escalates to MLRO.
+        Enforces strict Four-Eyes separation of duties (`maker_email != checker_email`).
+        """
+        import datetime as _dt
+
+        reviewer = extract_reviewer_identity(request)
+        data = request.get_json(silent=True) or {}
+        checker_action = (data.get("action") or "").strip().upper()
+        checker_rationale = (data.get("checker_rationale") or "").strip()
+
+        current_review = spanner_client.get_case_review(subject_id)
+        prev_state = current_review.get("review_state") or "UNREVIEWED"
+        maker_email = current_review.get("maker_email") or ""
+
+        if prev_state != "PENDING_CHECKER_APPROVAL":
+            return jsonify({
+                "error": f"Case is in state '{prev_state}', not 'PENDING_CHECKER_APPROVAL'. Maker must submit the case first."
+            }), 400
+
+        try:
+            new_state = validate_checker_decision(
+                maker_email=maker_email,
+                checker_identity=reviewer,
+                checker_action=checker_action,
+                checker_rationale=checker_rationale,
+            )
+        except FourEyesViolationError as e:
+            # Record the blocked self-approval attempt in the immutable audit trail!
+            spanner_client.append_audit_event(
+                subject_id=subject_id,
+                event_type="FOUR_EYES_VIOLATION_BLOCKED",
+                actor_email=reviewer.effective_email,
+                actor_auth_source=reviewer.auth_source,
+                previous_state=prev_state,
+                new_state=prev_state,
+                payload={
+                    "attempted_action": checker_action,
+                    "maker_email": maker_email,
+                    "checker_email": reviewer.effective_email,
+                    "authenticated_iap_email": reviewer.authenticated_email,
+                    "reason": str(e),
+                },
+            )
+            all_events = spanner_client.get_audit_events(subject_id)
+            return jsonify({
+                "error": str(e),
+                "code": "FOUR_EYES_VIOLATION",
+                "audit_events": all_events,
+                "audit_chain_verification": verify_audit_chain(all_events),
+            }), 409
+        except GovernanceValidationError as e:
+            return jsonify({"error": str(e)}), 400
+
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        current_review.update({
+            "review_state": new_state,
+            "checker_email": reviewer.effective_email,
+            "checker_auth_source": reviewer.auth_source,
+            "checker_action": checker_action,
+            "checker_rationale": checker_rationale,
+            "checker_decided_at": now_iso,
+        })
+        saved_review = spanner_client.save_case_review(current_review)
+
+        audit_event = spanner_client.append_audit_event(
+            subject_id=subject_id,
+            event_type=f"CHECKER_DECISION_{new_state}",
+            actor_email=reviewer.effective_email,
+            actor_auth_source=reviewer.auth_source,
+            previous_state=prev_state,
+            new_state=new_state,
+            payload={
+                "checker_action": checker_action,
+                "checker_rationale": checker_rationale,
+                "maker_email": maker_email,
+                "proposed_risk_rating": saved_review.get("proposed_risk_rating"),
+                "proposed_decision": saved_review.get("proposed_decision"),
+                "authenticated_iap_email": reviewer.authenticated_email,
+            },
+        )
+        all_events = spanner_client.get_audit_events(subject_id)
+        return jsonify({
+            "case_review": saved_review,
+            "audit_event": audit_event,
+            "audit_events": all_events,
+            "audit_chain_verification": verify_audit_chain(all_events),
+        })
+
     @app.route('/api/config', methods=['GET'])
     def get_app_config():
         """Serves application configuration options to the frontend."""
+        reviewer = extract_reviewer_identity(request)
         return jsonify({
             "SEARCH_TOOLTIPS": app.config['SEARCH_TOOLTIPS'],
             "RISK_CATEGORY_OPTIONS": get_risk_category_options(),
+            "REVIEWER": reviewer.to_dict(),
+            "GOVERNANCE_VOCABULARIES": {
+                "disposition_verdicts": DISPOSITION_VERDICTS,
+                "case_decisions": CASE_DECISIONS,
+                "risk_ratings": list(VALID_RISK_RATINGS),
+                "case_states": list(CASE_STATES),
+            },
         })
 
     @app.route('/', defaults={'path': ''})

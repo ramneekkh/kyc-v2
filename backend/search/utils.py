@@ -45,6 +45,7 @@ from .screening import (
     RECOMMENDATION_INCOMPLETE,
     RECOMMENDATION_NO_ADVERSE_MEDIA,
     RECOMMENDATION_REQUIRES_REVIEW,
+    RECOMMENDATION_SANCTIONS_HIT,
     SearchCoverage,
     SearchOutcome,
     incomplete_screening_summary,
@@ -625,6 +626,7 @@ def analyze_kyc_results(
     existing_url_fingerprints: dict = None,
     coverage: Optional[SearchCoverage] = None,
     session_usage: Optional[Dict] = None,
+    watchlist_screening: Optional[Dict] = None,
 ) -> Generator[Dict, None, None]:
     """
     Analyzes search results with a 3-phase pipeline:
@@ -886,6 +888,7 @@ def analyze_kyc_results(
                 safety_settings,
                 session_usage,
                 coverage=coverage,
+                watchlist_screening=watchlist_screening,
             )
 
             if summary_data is None:
@@ -898,7 +901,12 @@ def analyze_kyc_results(
                     "reasoning": "AI Generation Error",
                 }
 
-            summary_data = finalize_summary(summary_data, review_queue, coverage)
+            summary_data = finalize_summary(
+                summary_data,
+                review_queue,
+                coverage,
+                watchlist_screening=watchlist_screening,
+            )
 
             logging.info(f"Summary generated: {summary_data.get('risk_score', 'N/A')} Risk")
             yield {"type": "summary", "data": summary_data}
@@ -922,6 +930,7 @@ def analyze_kyc_results(
                 "recommendation": RECOMMENDATION_INCOMPLETE,
                 "reasoning": "System error during generation.",
                 "screening_coverage": coverage.to_dict() if coverage else None,
+                "watchlist_screening": watchlist_screening,
             }}
 
 
@@ -970,6 +979,7 @@ def build_human_review_queue(findings: List[Dict]) -> List[Dict]:
     for f in findings:
         url = f.get("url", "N/A")
         title = f.get("source_title", "Untitled")
+        finding_id = f.get("finding_id") or str(uuid.uuid5(uuid.NAMESPACE_URL, str(url)))
         match_status = (f.get("match_status") or "").strip()
         severity = _safe_int(f.get("risk_severity"), 0)
         identity = _safe_int(f.get("identity_confidence"), 0)
@@ -980,6 +990,9 @@ def build_human_review_queue(findings: List[Dict]) -> List[Dict]:
             # human can read a correction notice and decide if the original
             # adverse finding stands, was softened, or was retracted outright.
             queue.append({
+                "finding_id": finding_id,
+                "item_type": "FINDING",
+                "title": title,
                 "reason": "Source content changed after assessment",
                 "detail": (
                     f"'{title}' was amended at its original URL since the last "
@@ -990,18 +1003,27 @@ def build_human_review_queue(findings: List[Dict]) -> List[Dict]:
             })
         elif f.get("analysis_status") in ("Failed", "Unresolved"):
             queue.append({
+                "finding_id": finding_id,
+                "item_type": "FINDING",
+                "title": title,
                 "reason": "Article was not screened",
                 "detail": f"Automated analysis did not complete for '{title}'.",
                 "citations": [url],
             })
         elif match_status == "HITL":
             queue.append({
+                "finding_id": finding_id,
+                "item_type": "FINDING",
+                "title": title,
                 "reason": "Unresolved identity match",
                 "detail": f"'{title}' could not be confirmed or excluded as the subject.",
                 "citations": [url],
             })
         elif severity >= 3 and identity < 3:
             queue.append({
+                "finding_id": finding_id,
+                "item_type": "FINDING",
+                "title": title,
                 "reason": "Severe allegation, weak identity evidence",
                 "detail": (
                     f"'{title}' alleges serious conduct but identity confidence is "
@@ -1011,6 +1033,9 @@ def build_human_review_queue(findings: List[Dict]) -> List[Dict]:
             })
         elif severity >= 3 and not f.get("content_available", True):
             queue.append({
+                "finding_id": finding_id,
+                "item_type": "FINDING",
+                "title": title,
                 "reason": "Severe allegation, article text unavailable",
                 "detail": f"'{title}' could not be retrieved; assessment rests on the snippet alone.",
                 "citations": [url],
@@ -1022,6 +1047,7 @@ def finalize_summary(
     summary_data: Dict,
     review_queue: List[Dict],
     coverage: Optional[SearchCoverage],
+    watchlist_screening: Optional[Dict] = None,
 ) -> Dict:
     """
     Applies non-negotiable post-conditions to a model-generated summary.
@@ -1031,13 +1057,32 @@ def finalize_summary(
     """
     summary_data = dict(summary_data or {})
 
+    # 0. Prepend any Watchlist / Sanctions hits to the deterministic review queue.
+    watchlist_queue_items: List[Dict] = []
+    if isinstance(watchlist_screening, dict):
+        summary_data["watchlist_screening"] = watchlist_screening
+        for hit in (watchlist_screening.get("hits") or []):
+            if not isinstance(hit, dict):
+                continue
+            watchlist_queue_items.append({
+                "finding_id": hit.get("hit_id"),
+                "item_type": "WATCHLIST_HIT",
+                "title": f"[{hit.get('list_id')}] {hit.get('primary_name')}",
+                "reason": (
+                    f"Sanctions / Watchlist match ({hit.get('list_name')} — "
+                    f"{hit.get('match_strength')} {float(hit.get('match_score', 0)) * 100:.0f}%)"
+                ),
+                "detail": hit.get("explanation") or "",
+                "citations": [f"{hit.get('list_id')}:{hit.get('entity_id')}"],
+            })
+
     # 1. Merge the deterministic review queue with anything the model flagged.
     model_flags = summary_data.get("requires_human_review") or []
     if not isinstance(model_flags, list):
         model_flags = []
     seen = set()
     merged = []
-    for entry in list(model_flags) + list(review_queue):
+    for entry in watchlist_queue_items + list(model_flags) + list(review_queue):
         if not isinstance(entry, dict):
             continue
         key = (entry.get("reason"), tuple(entry.get("citations") or []))
@@ -1068,6 +1113,37 @@ def finalize_summary(
             f"{len(merged)} item(s) require human review."
         ).strip()
 
+    # 3b. Enforce Watchlist / Sanctions screening outcomes.
+    if isinstance(watchlist_screening, dict):
+        wl_cov = watchlist_screening.get("coverage") or {}
+        confirmed_wl = int(watchlist_screening.get("confirmed_hits") or 0)
+        strong_wl = int(watchlist_screening.get("strong_hits") or 0)
+        potential_wl = int(watchlist_screening.get("potential_hits") or 0)
+
+        if confirmed_wl > 0 or strong_wl > 0:
+            recommendation = RECOMMENDATION_SANCTIONS_HIT
+            summary_data["risk_score"] = "Critical"
+            alert_prefix = (
+                f"SANCTIONS / WATCHLIST MATCH DETECTED ({confirmed_wl} confirmed, "
+                f"{strong_wl} strong hit(s) across authoritative designations). "
+            )
+            curr_summary = str(summary_data.get("summary", ""))
+            if not curr_summary.startswith("SANCTIONS / WATCHLIST MATCH"):
+                summary_data["summary"] = alert_prefix + curr_summary
+        elif potential_wl > 0:
+            if summary_data.get("risk_score") in (None, "Low"):
+                summary_data["risk_score"] = "Medium"
+            if recommendation == RECOMMENDATION_NO_ADVERSE_MEDIA:
+                recommendation = RECOMMENDATION_REQUIRES_REVIEW
+
+        if wl_cov and not wl_cov.get("is_complete", True):
+            recommendation = RECOMMENDATION_INCOMPLETE
+            summary_data["risk_score"] = "Unknown"
+            summary_data["summary"] = (
+                f"INCOMPLETE WATCHLIST SCREENING. {wl_cov.get('description', '')} "
+                + str(summary_data.get("summary", ""))
+            )
+
     # 4. Degraded coverage overrides everything below it.
     if coverage is not None:
         summary_data["screening_coverage"] = coverage.to_dict()
@@ -1090,6 +1166,7 @@ def generate_kyc_summary_logic(
     safety_settings,
     session_usage,
     coverage: Optional[SearchCoverage] = None,
+    watchlist_screening: Optional[Dict] = None,
 ):
     """
     Reusable logic for generating KYC summary with Map-Reduce for large contexts.
@@ -1099,16 +1176,17 @@ def generate_kyc_summary_logic(
     """
     # The empty-findings path is the single most dangerous branch in this system:
     # it is the one that declares a subject clean. It must never be reachable from
-    # an infrastructure failure.
+    # an infrastructure failure OR when a sanctions watchlist hit exists.
     if not relevant_findings:
         if coverage is not None and not coverage.is_complete:
             logging.error(
                 "Refusing to issue a clean result for %s: %s", subject_name, coverage.describe()
             )
-            return incomplete_screening_summary(subject_name, coverage)
+            res = incomplete_screening_summary(subject_name, coverage)
+            return finalize_summary(res, [], coverage, watchlist_screening=watchlist_screening)
 
         logging.info("No material findings for summary.")
-        return {
+        base_clean = {
             "risk_score": "Low",
             "summary": (
                 f"No adverse media was identified for {subject_name} in this open-source scan. "
@@ -1121,6 +1199,7 @@ def generate_kyc_summary_logic(
             "reasoning": "No adverse media returned by the sources searched.",
             "screening_coverage": coverage.to_dict() if coverage else None,
         }
+        return finalize_summary(base_clean, [], coverage, watchlist_screening=watchlist_screening)
 
     # --- Chunking Logic to handle Token Limits ---
     # Heuristic: 1 token ~ 4 chars. 1M token limit -> ~4MB text.

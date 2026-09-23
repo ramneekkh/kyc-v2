@@ -25,6 +25,7 @@ import SearchArea from './components/SearchArea';
 import IdentityPanel from './components/IdentityPanel';
 import ProcessLog from './components/ProcessLog';
 import DocumentChecker from './components/DocumentChecker';
+import { WatchlistScreeningPanel, MakerCheckerGovernancePanel } from './components/GovernanceAndWatchlist';
 
 // --- Reusable Components (Keep mainly existing ones for consistency if needed by children) ---
 const Spinner = ({ size = 'md' }) => {
@@ -99,6 +100,7 @@ const ReputationBadge = ({ rep }) => {
 
 const RiskIndicator = ({ level }) => {
     const config = {
+        'Critical': { text: 'Critical Sanctions Risk', icon: <ShieldAlert size={16} />, color: 'bg-red-900 text-red-100 border-red-500' },
         'High': { text: 'High Risk', icon: <AlertTriangle size={16} />, color: 'bg-red-100 text-red-800 border-red-200' },
         'Medium': { text: 'Medium Risk', icon: <AlertTriangle size={16} />, color: 'bg-yellow-100 text-yellow-800 border-yellow-200' },
         'Low': { text: 'Low Risk', icon: <CheckCircle size={16} />, color: 'bg-blue-100 text-blue-800 border-blue-200' },
@@ -370,12 +372,15 @@ const ResultsTable = ({ results, riskCategoryFilter, onFilterChange, appConfig, 
 const RECOMMENDATION_NO_ADVERSE_MEDIA = 'No Adverse Media Found';
 const RECOMMENDATION_REQUIRES_REVIEW = 'Adverse Media - Requires Review';
 const RECOMMENDATION_ESCALATE = 'Adverse Media - Escalate';
+const RECOMMENDATION_SANCTIONS_HIT = 'Sanctions / Watchlist Match - Escalate to Compliance / MLRO';
 const RECOMMENDATION_INCOMPLETE = 'Screening Incomplete - Manual Review Required';
 
 const recommendationStyle = (recommendation) => {
     switch (recommendation) {
         case RECOMMENDATION_NO_ADVERSE_MEDIA:
             return 'bg-emerald-900/30 text-emerald-300 border-emerald-800';
+        case RECOMMENDATION_SANCTIONS_HIT:
+            return 'bg-red-950 text-red-200 border-red-500 shadow-sm';
         case RECOMMENDATION_ESCALATE:
             return 'bg-red-900/30 text-red-300 border-red-800';
         case RECOMMENDATION_INCOMPLETE:
@@ -392,6 +397,7 @@ const RecommendationIcon = ({ recommendation }) => {
     switch (recommendation) {
         case RECOMMENDATION_NO_ADVERSE_MEDIA:
             return <CheckCircle size={14} />;
+        case RECOMMENDATION_SANCTIONS_HIT:
         case RECOMMENDATION_ESCALATE:
             return <ShieldAlert size={14} />;
         case RECOMMENDATION_INCOMPLETE:
@@ -583,13 +589,120 @@ function App() {
     const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
     const [existingSubject, setExistingSubject] = useState(null);
     const [loadedGraphData, setLoadedGraphData] = useState(null);
+    const [currentSubjectId, setCurrentSubjectId] = useState(null);
+    const [watchlistData, setWatchlistData] = useState(null);
+    const [watchlistStatus, setWatchlistStatus] = useState(null);
+    const [refreshingLists, setRefreshingLists] = useState(false);
+    const [governanceState, setGovernanceState] = useState(null);
+    const [personaKey, setPersonaKey] = useState('maker');
+    const [savingWatchlistHitId, setSavingWatchlistHitId] = useState(null);
 
     const eventSourceRef = useRef(null);
+
+    const iapBaseEmail =
+        governanceState?.reviewer?.authenticated_email ||
+        appConfig?.REVIEWER?.authenticated_email ||
+        'admin@ramneekkhurana.altostrat.com';
+
+    const activePersona = useMemo(() => {
+        if (personaKey === 'checker') {
+            return {
+                key: 'checker',
+                role: 'CHECKER',
+                email: 'compliance.checker@ramneekkhurana.altostrat.com',
+            };
+        }
+        return {
+            key: 'maker',
+            role: 'MAKER',
+            email: iapBaseEmail,
+        };
+    }, [personaKey, iapBaseEmail]);
+
+    const fetchSubjectGovernance = async (subjId) => {
+        if (!subjId) return;
+        try {
+            const res = await fetch(`/api/subjects/${subjId}/governance`, {
+                headers: {
+                    'X-KYC-Acting-Reviewer': activePersona.email,
+                    'X-KYC-Acting-Role': activePersona.role,
+                },
+            });
+            if (res.ok) {
+                const gData = await res.json();
+                setGovernanceState(gData);
+                if (gData.watchlist_hits && gData.watchlist_hits.length > 0) {
+                    setWatchlistData(prev => prev || {
+                        status: gData.watchlist_hits.some(h => h.match_strength === 'CONFIRMED' || h.match_strength === 'STRONG')
+                            ? 'SANCTIONS_HIT_DETECTED'
+                            : 'POTENTIAL_MATCH_REVIEW_REQUIRED',
+                        total_hits: gData.watchlist_hits.length,
+                        confirmed_hits: gData.watchlist_hits.filter(h => h.match_strength === 'CONFIRMED').length,
+                        strong_hits: gData.watchlist_hits.filter(h => h.match_strength === 'STRONG').length,
+                        potential_hits: gData.watchlist_hits.filter(h => h.match_strength === 'POTENTIAL').length,
+                        hits: gData.watchlist_hits,
+                        coverage: watchlistStatus,
+                    });
+                }
+            }
+        } catch (err) {
+            console.error('Failed to load subject governance:', err);
+        }
+    };
+
+    const handleRefreshWatchlists = async () => {
+        setRefreshingLists(true);
+        try {
+            const res = await fetch('/api/watchlist/refresh', { method: 'POST' });
+            const cov = await res.json();
+            setWatchlistStatus(cov);
+            if (watchlistData) {
+                setWatchlistData(prev => ({ ...prev, coverage: cov }));
+            }
+        } catch (err) {
+            console.error('Watchlist refresh error:', err);
+        } finally {
+            setRefreshingLists(false);
+        }
+    };
+
+    const handleSaveWatchlistHitDisposition = async ({ item_id, item_type, item_title, verdict, rationale }) => {
+        if (!currentSubjectId) return;
+        setSavingWatchlistHitId(item_id);
+        try {
+            const res = await fetch(`/api/subjects/${currentSubjectId}/dispositions`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-KYC-Acting-Reviewer': activePersona.email,
+                    'X-KYC-Acting-Role': activePersona.role,
+                },
+                body: JSON.stringify({ item_id, item_type, item_title, verdict, rationale }),
+            });
+            const data = await res.json();
+            if (res.ok) {
+                setGovernanceState(prev => ({
+                    ...(prev || {}),
+                    case_review: data.case_review,
+                    dispositions: data.dispositions,
+                    audit_events: data.audit_events,
+                    audit_chain_verification: data.audit_chain_verification,
+                }));
+            } else {
+                alert(data.error || 'Failed to record watchlist disposition');
+            }
+        } catch (err) {
+            console.error(err);
+        } finally {
+            setSavingWatchlistHitId(null);
+        }
+    };
 
     // Initial Data Fetch
     useEffect(() => {
         fetch('/api/config').then(res => res.json()).then(setAppConfig).catch(console.error);
         fetch('/api/subjects').then(res => res.json()).then(setSavedSubjects).catch(console.error);
+        fetch('/api/watchlist/status').then(res => res.json()).then(setWatchlistStatus).catch(console.error);
     }, []);
 
     const handleLoadSubject = async (subjectId) => {
@@ -598,6 +711,9 @@ function App() {
         setResults([]);
         setSummary(null);
         setCoverageAlert(null);
+        setWatchlistData(null);
+        setGovernanceState(null);
+        setCurrentSubjectId(subjectId);
         setProgress([]);
         setCandidates([]);
         setSelectedCandidate(null);
@@ -608,13 +724,41 @@ function App() {
             if (!res.ok) throw new Error("Failed to load subject");
             const data = await res.json();
 
+            let parsedSummary = null;
             try {
-                const parsedSummary = data.subject.summary ? (typeof data.subject.summary === 'string' ? JSON.parse(data.subject.summary) : data.subject.summary) : null;
+                parsedSummary = data.subject.summary ? (typeof data.subject.summary === 'string' ? JSON.parse(data.subject.summary) : data.subject.summary) : null;
                 setSummary(parsedSummary);
             } catch (e) {
                 console.warn("Failed to parse summary JSON", e);
                 setSummary(data.subject.summary);
             }
+            if (parsedSummary && parsedSummary.watchlist_screening) {
+                setWatchlistData(parsedSummary.watchlist_screening);
+            } else if (data.watchlist_hits) {
+                const hits = data.watchlist_hits;
+                setWatchlistData({
+                    status: hits.some(h => h.match_strength === 'CONFIRMED' || h.match_strength === 'STRONG')
+                        ? 'SANCTIONS_HIT_DETECTED'
+                        : hits.length > 0
+                            ? 'POTENTIAL_MATCH_REVIEW_REQUIRED'
+                            : 'CLEAR',
+                    total_hits: hits.length,
+                    confirmed_hits: hits.filter(h => h.match_strength === 'CONFIRMED').length,
+                    strong_hits: hits.filter(h => h.match_strength === 'STRONG').length,
+                    potential_hits: hits.filter(h => h.match_strength === 'POTENTIAL').length,
+                    hits,
+                    coverage: watchlistStatus,
+                });
+            }
+            setGovernanceState({
+                subject_id: subjectId,
+                reviewer: data.reviewer,
+                case_review: data.case_review,
+                dispositions: data.dispositions || {},
+                watchlist_hits: data.watchlist_hits || [],
+                audit_events: data.audit_events || [],
+                audit_chain_verification: data.audit_chain_verification || { valid: true, event_count: 0 },
+            });
             setResults(data.findings || []);
             setExistingSubject(data.subject);
             setSearchSubject(data.subject.name);
@@ -647,6 +791,8 @@ function App() {
         setResults([]);
         setSummary(null);
         setCoverageAlert(null);
+        setWatchlistData(null);
+        setGovernanceState(null);
         setCandidates([]);
         setPriorityQueries([]);
         setGeneratedQueries([]);
@@ -678,6 +824,19 @@ function App() {
                 const data = JSON.parse(event.data);
 
                 switch (data.status) {
+                    case 'subject_initialized':
+                        if (data.subject_id) {
+                            setCurrentSubjectId(data.subject_id);
+                        }
+                        break;
+                    case 'watchlist_results':
+                        setWatchlistData(data.data);
+                        if (data.subject_id) {
+                            setCurrentSubjectId(data.subject_id);
+                            fetchSubjectGovernance(data.subject_id);
+                        }
+                        setProgress(prev => [...prev, data]);
+                        break;
                     case 'queries_generated':
                         setGeneratedQueries(data.data || []);
                         setProgress(prev => [...prev, data]);
@@ -702,6 +861,12 @@ function App() {
                     case 'kyc_summary_generated':
                         console.log("Summary received:", data.data);
                         setSummary(data.data);
+                        if (data.data?.watchlist_screening) {
+                            setWatchlistData(data.data.watchlist_screening);
+                        }
+                        if (data.subject_id) {
+                            fetchSubjectGovernance(data.subject_id);
+                        }
                         setProgress(prev => [...prev, data]);
                         break;
                     case 'kyc_graph_generated':
@@ -727,6 +892,9 @@ function App() {
                     case 'complete':
                         if (data.screening_incomplete) {
                             setCoverageAlert({ severity: 'critical', message: data.message });
+                        }
+                        if (data.subject_id) {
+                            fetchSubjectGovernance(data.subject_id);
                         }
                         setIsSearching(false);
                         es.close();
@@ -1033,10 +1201,44 @@ function App() {
                                 </div>
                             )}
 
+                            {(watchlistData || watchlistStatus) && (
+                                <div className="mb-6">
+                                    <ErrorBoundary>
+                                        <WatchlistScreeningPanel
+                                            watchlistData={watchlistData}
+                                            watchlistStatus={watchlistStatus}
+                                            onRefreshLists={handleRefreshWatchlists}
+                                            refreshingLists={refreshingLists}
+                                            dispositions={governanceState?.dispositions || {}}
+                                            onSaveDisposition={currentSubjectId ? handleSaveWatchlistHitDisposition : null}
+                                            savingItemId={savingWatchlistHitId}
+                                            isCaseLocked={governanceState?.case_review?.review_state === 'APPROVED'}
+                                        />
+                                    </ErrorBoundary>
+                                </div>
+                            )}
+
                             {summary && (
-                                <div className="mb-8">
+                                <div className="mb-6">
                                     <ErrorBoundary>
                                         <SummaryReport summary={summary} />
+                                    </ErrorBoundary>
+                                </div>
+                            )}
+
+                            {currentSubjectId && (summary || watchlistData || governanceState) && (
+                                <div className="mb-8">
+                                    <ErrorBoundary>
+                                        <MakerCheckerGovernancePanel
+                                            subjectId={currentSubjectId}
+                                            subjectName={searchSubject}
+                                            summary={summary}
+                                            watchlistHits={watchlistData?.hits || governanceState?.watchlist_hits || []}
+                                            governanceState={governanceState}
+                                            activePersona={activePersona}
+                                            onChangePersona={setPersonaKey}
+                                            onRefreshGovernance={() => fetchSubjectGovernance(currentSubjectId)}
+                                        />
                                     </ErrorBoundary>
                                 </div>
                             )}
